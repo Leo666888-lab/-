@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#147d6f" />
+    <title>思燕结算台 · 商业版</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="./vendor/lucide.js" defer></script>
+  </head>
+  <body>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="syncStatus" class="sync-status hidden" role="status" aria-live="polite"><span></span><span id="syncStatusText">正在同步</span></div>
+
+    <section id="loginScreen" class="login-screen">
+      <div class="login-story">
+        <div class="story-brand"><span class="brand-mark">思</span><span>思燕结算台</span></div>
+        <div class="story-copy">
+          <p class="eyebrow">SIYAN SETTLEMENT DESK</p>
+          <h1>每一笔货款，<br /><em>都有着落。</em></h1>
+          <p>把订单、交货、收付款和提醒放在一条清楚的线上，家里人打开就会用。</p>
+        </div>
+        <div class="story-foot"><span class="status-dot"></span> 商业功能验证环境 · 数据来自企业账本 API</div>
+      </div>
+      <div class="login-panel">
+        <div class="login-heading">
+          <span class="brand-mark small">思</span>
+          <div><strong>欢迎回来</strong><span>登录你的企业账本</span></div>
+        </div>
+        <div class="auth-tabs" aria-label="登录方式">
+          <span class="auth-tab active">密码登录</span>
+          <span class="integration-tag">短信登录待接入</span>
+        </div>
+        <form id="loginForm" class="login-form">
+          <label>手机号<input id="loginPhone" type="tel" inputmode="tel" autocomplete="username" required /></label>
+          <label>密码<input id="loginPassword" type="password" autocomplete="current-password" required /></label>
+          <p id="loginError" class="form-error hidden"></p>
+          <div class="login-options"><span class="security-note"><i data-lucide="shield-check"></i>安全会话，不在浏览器长期保存密码或令牌</span><button class="text-button" type="button" data-action="fill-test-account">填入本地测试账号</button></div>
+          <button id="loginSubmit" class="primary-button wide" type="submit"><i data-lucide="arrow-right"></i>进入结算台</button>
+        </form>
+        <p class="login-note">测试账号仅适用于本地种子数据，生产环境必须关闭测试数据。</p>
+      </div>
+    </section>
+
+    <div id="appShell" class="app-shell hidden">
+      <button id="sidebarScrim" class="sidebar-scrim hidden" type="button" aria-label="关闭菜单"></button>
+      <aside id="sidebar" class="sidebar">
+        <div class="sidebar-brand"><span class="brand-mark">思</span><div><strong>思燕结算台</strong><span>企业收付管理</span></div><button id="sidebarClose" class="icon-button mobile-only" type="button" aria-label="关闭菜单"><i data-lucide="x"></i></button></div>
+        <div class="workspace-switch"><span id="workspaceAvatar" class="workspace-avatar">企</span><div><strong id="workspaceName">企业账本</strong><span id="workspaceMeta">正在连接</span></div><i data-lucide="building-2"></i></div>
+        <nav class="side-nav" aria-label="主导航">
+          <p class="nav-label">工作台</p>
+          <button class="nav-item active" data-view="overview"><i data-lucide="layout-dashboard"></i><span>结算总览</span><b class="nav-count" data-nav-count="overview">0</b></button>
+          <button class="nav-item" data-view="receivable"><i data-lucide="arrow-down-left"></i><span>客户应收</span><b data-nav-count="receivable">0</b></button>
+          <button class="nav-item" data-view="payable"><i data-lucide="arrow-up-right"></i><span>供应商应付</span><b data-nav-count="payable">0</b></button>
+          <button class="nav-item" data-view="orders"><i data-lucide="file-text"></i><span>全部订单</span></button>
+          <p class="nav-label">资料与工具</p>
+          <button class="nav-item" data-view="contacts"><i data-lucide="contact"></i><span>客户/供应商</span></button>
+          <button class="nav-item" data-view="reminders"><i data-lucide="bell-ring"></i><span>提醒中心</span><b class="nav-count" data-nav-count="reminders">0</b></button>
+          <button class="nav-item" data-view="imports"><i data-lucide="file-up"></i><span>导入数据</span><span class="nav-new">待接入</span></button>
+          <button class="nav-item" data-view="ocr"><i data-lucide="scan-line"></i><span>纸单识别</span><span class="nav-new">测试</span></button>
+        </nav>
+        <div class="sidebar-footer"><button class="nav-item" data-view="settings"><i data-lucide="settings-2"></i><span>工作区设置</span></button><button id="logoutButton" class="logout-button"><i data-lucide="log-out"></i>退出登录</button></div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <button id="mobileMenu" class="icon-button mobile-only" type="button" aria-label="打开菜单" aria-controls="sidebar" aria-expanded="false"><i data-lucide="menu"></i></button>
+          <div class="breadcrumb"><span id="breadcrumbRoot">工作台</span><i data-lucide="chevron-right"></i><strong id="breadcrumbCurrent">结算总览</strong></div>
+          <div class="topbar-actions"><button class="icon-button" id="refreshButton" type="button" aria-label="刷新数据" title="刷新数据"><i data-lucide="refresh-cw"></i></button><button class="icon-button" id="globalSearchButton" type="button" aria-label="搜索订单"><i data-lucide="search"></i></button><button class="icon-button notification-button" data-view="reminders" type="button" aria-label="提醒"><i data-lucide="bell"></i><span id="notificationDot"></span></button><button class="user-menu" type="button" data-action="account-menu"><span id="userAvatar" class="user-avatar">用</span><span id="userName" class="desktop-only">当前用户</span><i data-lucide="chevron-down"></i></button></div>
+        </header>
+
+        <div id="view-overview" class="view active"></div>
+        <div id="view-receivable" class="view"></div>
+        <div id="view-payable" class="view"></div>
+        <div id="view-orders" class="view"></div>
+        <div id="view-contacts" class="view"></div>
+        <div id="view-reminders" class="view"></div>
+        <div id="view-imports" class="view"></div>
+        <div id="view-ocr" class="view"></div>
+        <div id="view-settings" class="view"></div>
+      </main>
+      <nav class="mobile-bottom-nav" aria-label="手机快捷导航">
+        <button class="mobile-nav-item active" data-view="overview"><i data-lucide="layout-dashboard"></i><span>总览</span></button>
+        <button class="mobile-nav-item" data-view="receivable"><i data-lucide="arrow-down-left"></i><span>应收</span><b data-mobile-count="receivable">0</b></button>
+        <button class="mobile-nav-item" data-view="payable"><i data-lucide="arrow-up-right"></i><span>应付</span><b data-mobile-count="payable">0</b></button>
+        <button class="mobile-nav-item" data-view="reminders"><i data-lucide="bell-ring"></i><span>提醒</span><b data-mobile-count="reminders">0</b></button>
+      </nav>
+    </div>
+
+    <div id="orderModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-large" role="dialog" aria-modal="true" aria-labelledby="orderModalTitle">
+        <div class="modal-header"><div><p class="eyebrow">NEW LEDGER ENTRY</p><h2 id="orderModalTitle">新建结算订单</h2></div><button class="icon-button close-modal" data-close="orderModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <div class="direction-switch"><button class="direction-tab active" data-direction="receivable" type="button"><i data-lucide="arrow-down-left"></i>客户应收</button><button class="direction-tab" data-direction="payable" type="button"><i data-lucide="arrow-up-right"></i>供应商应付</button></div>
+        <form id="orderForm" class="order-form">
+          <div class="form-grid">
+            <label>客户/供应商<select id="orderPartner" required></select></label>
+            <label>订单编号<input id="orderNumber" required /><span class="field-hint">自动生成，可人工修改</span></label>
+            <label>订货日期<input id="orderDate" type="date" required /></label>
+            <label>计划交货/收货日期<input id="plannedDeliveryDate" type="date" /></label>
+            <label>结算周期<select id="settlementCycle"><option value="days:0">交货即结</option><option value="days:7">交货后 7 天</option><option value="days:30" selected>交货后 30 天</option><option value="months:3">交货后 3 个月</option><option value="custom">自定义天数</option></select></label>
+            <label id="customSettlementField" class="hidden">自定义账期（天）<input id="customSettlementDays" type="number" min="0" max="3650" value="30" /></label>
+            <label>币种<select id="orderCurrency"><option value="CNY">CNY 人民币</option><option value="USD">USD 美元</option><option value="AED">AED 迪拉姆</option><option value="SAR">SAR 沙特里亚尔</option></select></label>
+            <label class="full">订单备注<textarea id="orderNotes" rows="2" maxlength="2000" placeholder="可填写客户要求、装箱说明等"></textarea></label>
+          </div>
+          <div class="line-items-heading"><div><h3>商品明细</h3><span>服务端会按数量和单价重新计算订单总额</span></div><button id="addLineItem" class="outline-button small-button" type="button"><i data-lucide="plus"></i>添加商品</button></div>
+          <div class="line-items-wrap"><table class="line-items-table commercial-lines"><thead><tr><th>商品说明</th><th>数量</th><th>单价</th><th>小计</th><th></th></tr></thead><tbody id="lineItemsBody"></tbody></table></div>
+          <div class="order-submit-bar"><div class="order-total"><span>订单总金额</span><strong id="orderTotal">¥0.00</strong></div><div class="modal-footer"><button class="outline-button close-modal" data-close="orderModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="check"></i>保存订单</button></div></div>
+        </form>
+      </section>
+    </div>
+
+    <div id="paymentModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="paymentModalTitle">
+        <div class="modal-header"><div><p class="eyebrow">SETTLEMENT RECORD</p><h2 id="paymentModalTitle">登记收付款</h2></div><button class="icon-button close-modal" data-close="paymentModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <div id="paymentContext" class="payment-context"></div>
+        <form id="paymentForm" class="stack-form"><input id="paymentOrderId" type="hidden" /><input id="paymentIdempotencyKey" type="hidden" /><label>本次金额<input id="paymentAmount" type="number" min="0.01" step="0.01" required /></label><label>收付款时间<input id="paymentDate" type="datetime-local" required /></label><label>方式<select id="paymentMethod"><option value="bank_transfer">银行转账</option><option value="wechat">微信</option><option value="cash">现金</option><option value="alipay">支付宝</option></select></label><label>备注<textarea id="paymentNote" rows="3" maxlength="1000" placeholder="例如：客户先付定金"></textarea></label><div class="pending-note"><i data-lucide="paperclip"></i><div><strong>付款凭证待接入</strong><span>对象存储和文件安全扫描尚未接入，本页不会伪造凭证上传。</span></div></div><div class="modal-footer"><button class="outline-button close-modal" data-close="paymentModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="wallet-cards"></i>确认登记</button></div></form>
+      </section>
+    </div>
+
+    <div id="fulfillModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="fulfillModalTitle">
+        <div class="modal-header"><div><p class="eyebrow">CONFIRM DELIVERY</p><h2 id="fulfillModalTitle">确认实际交货</h2></div><button class="icon-button close-modal" data-close="fulfillModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <div id="fulfillContext" class="payment-context"></div>
+        <form id="fulfillForm" class="stack-form"><input id="fulfillOrderId" type="hidden" /><label>实际交货/收货时间<input id="fulfilledAt" type="datetime-local" required /></label><div class="pending-note important"><i data-lucide="circle-alert"></i><div><strong>确认后才进入结算</strong><span>系统会以实际交货时间计算到期日并生成提醒，此操作会写入审计记录。</span></div></div><div class="modal-footer"><button class="outline-button close-modal" data-close="fulfillModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="package-check"></i>确认交货</button></div></form>
+      </section>
+    </div>
+
+    <div id="snoozeModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="snoozeModalTitle">
+        <div class="modal-header"><div><p class="eyebrow">SNOOZE REMINDER</p><h2 id="snoozeModalTitle">暂缓提醒</h2></div><button class="icon-button close-modal" data-close="snoozeModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <form id="snoozeForm" class="stack-form"><input id="snoozeReminderId" type="hidden" /><label>下次提醒时间<input id="snoozeUntil" type="datetime-local" required /></label><div class="modal-footer"><button class="outline-button close-modal" data-close="snoozeModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="clock-3"></i>确认暂缓</button></div></form>
+      </section>
+    </div>
+
+    <div id="partnerModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="partnerModalTitle">
+        <div class="modal-header"><div><p class="eyebrow">BUSINESS PARTNER</p><h2 id="partnerModalTitle">新增往来单位</h2></div><button class="icon-button close-modal" data-close="partnerModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <form id="partnerForm" class="stack-form"><input id="partnerId" type="hidden" /><input id="partnerVersion" type="hidden" /><label>名称<input id="partnerName" maxlength="200" dir="auto" required /></label><label>类型<select id="partnerKind"><option value="customer">客户</option><option value="supplier">供应商</option><option value="both">客户 / 供应商</option></select></label><label>联系人<input id="partnerContactName" maxlength="100" dir="auto" /></label><label>联系电话<input id="partnerPhone" maxlength="64" dir="auto" /></label><div class="modal-footer"><button class="outline-button close-modal" data-close="partnerModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="check"></i>保存往来单位</button></div></form>
+      </section>
+    </div>
+
+    <div id="passwordModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="passwordModalTitle">
+        <div class="modal-header"><div><p class="eyebrow">ACCOUNT SECURITY</p><h2 id="passwordModalTitle">修改密码</h2></div><button class="icon-button close-modal" data-close="passwordModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <form id="passwordForm" class="stack-form"><label>当前密码<input id="currentPassword" type="password" autocomplete="current-password" required /></label><label>新密码<input id="newPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /><span class="field-hint">至少 12 位</span></label><label>确认新密码<input id="confirmPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /></label><div class="pending-note important"><i data-lucide="shield-check"></i><div><strong>修改后保留当前会话</strong><span>服务器会撤销该账号的其他登录会话。</span></div></div><div class="modal-footer"><button class="outline-button close-modal" data-close="passwordModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="key-round"></i>确认修改</button></div></form>
+      </section>
+    </div>
+
+    <div id="detailModal" class="modal-backdrop hidden" aria-hidden="true"><section class="modal modal-large" role="dialog" aria-modal="true" aria-labelledby="detailTitle"><div class="modal-header"><div><p class="eyebrow">ORDER DETAIL</p><h2 id="detailTitle">订单详情</h2></div><button class="icon-button close-modal" data-close="detailModal" aria-label="关闭"><i data-lucide="x"></i></button></div><div id="detailContent"></div></section></div>
+
+    <div id="reversalModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-small" role="alertdialog" aria-modal="true" aria-labelledby="reversalModalTitle" aria-describedby="reversalWarning">
+        <div class="modal-header"><div><p class="eyebrow">REVERSE PAYMENT</p><h2 id="reversalModalTitle">冲销收付款</h2></div><button class="icon-button close-modal" data-close="reversalModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <div id="reversalContext" class="payment-context reversal-context"></div>
+        <form id="reversalForm" class="stack-form"><input id="reversalPaymentId" type="hidden" /><input id="reversalOrderId" type="hidden" /><input id="reversalIdempotencyKey" type="hidden" /><label>冲销原因<textarea id="reversalReason" rows="4" maxlength="2000" dir="auto" placeholder="例如：重复入账、金额录错" required></textarea></label><div id="reversalWarning" class="pending-note danger-note"><i data-lucide="triangle-alert"></i><div><strong>原付款流水不会删除</strong><span>确认后系统会保留原记录及冲销原因，并重新计算未结余额和提醒。</span></div></div><div class="modal-footer"><button class="outline-button close-modal" data-close="reversalModal" type="button">返回</button><button class="danger-button" type="submit"><i data-lucide="undo-2"></i>确认冲销</button></div></form>
+      </section>
+    </div>
+
+    <div id="cancelOrderModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-small" role="alertdialog" aria-modal="true" aria-labelledby="cancelOrderModalTitle" aria-describedby="cancelOrderWarning">
+        <div class="modal-header"><div><p class="eyebrow">CANCEL ORDER</p><h2 id="cancelOrderModalTitle">取消订单</h2></div><button class="icon-button close-modal" data-close="cancelOrderModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <div id="cancelOrderContext" class="payment-context cancellation-context"></div>
+        <form id="cancelOrderForm" class="stack-form"><input id="cancelOrderId" type="hidden" /><div id="cancelOrderWarning" class="pending-note danger-note"><i data-lucide="circle-alert"></i><div><strong>请再次确认取消</strong><span>取消后不能确认交货或登记收付款，此操作会写入审计记录。</span></div></div><div class="modal-footer"><button class="outline-button close-modal" data-close="cancelOrderModal" type="button">保留订单</button><button class="danger-button" type="submit"><i data-lucide="ban"></i>确认取消</button></div></form>
+      </section>
+    </div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

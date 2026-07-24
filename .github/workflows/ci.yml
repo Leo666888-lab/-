@@ -1,0 +1,288 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Use Node.js 24.18.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Test frontend safety and multilingual handling
+        run: node public/frontend-tests.mjs
+
+      - name: Audit production and development dependencies
+        run: npm audit --audit-level=high
+
+      - name: Build production release artifact
+        run: |
+          source_date_epoch="$(git show -s --format=%ct "${GITHUB_SHA}")"
+          deploy/scripts/build-release-artifact.sh \
+            "${RUNNER_TEMP}" "${GITHUB_SHA}" "${source_date_epoch}"
+
+      - name: Upload production release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: siyan-settlement-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/siyan-settlement-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/siyan-settlement-${{ github.sha }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release-smoke:
+    needs: application
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: settlement_ci
+          POSTGRES_PASSWORD: settlement_ci_password
+          POSTGRES_DB: settlement_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username=settlement_ci --dbname=settlement_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Use Node.js 24.18.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+
+      - name: Download production release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: siyan-settlement-${{ github.sha }}
+          path: ${{ runner.temp }}/release-download
+
+      - name: Verify and extract production release artifact
+        run: |
+          archive_name="siyan-settlement-${GITHUB_SHA}.tar.gz"
+          download_dir="${RUNNER_TEMP}/release-download"
+          release_dir="${RUNNER_TEMP}/release-smoke"
+          cd "${download_dir}"
+          sha256sum -c "${archive_name}.sha256"
+          install -d "${release_dir}"
+          tar --no-same-owner --no-same-permissions -xzf "${archive_name}" -C "${release_dir}"
+          cd "${release_dir}"
+          sha256sum -c SHA256SUMS
+          test -f dist/src/server.js
+          test -f public/index.html
+          test -d node_modules/fastify
+
+      - name: Start and stop the release through the production systemd unit
+        run: |
+          release_dir="${RUNNER_TEMP}/release-smoke"
+          release_target="/opt/siyan-settlement-666/releases/${GITHUB_SHA}"
+          cleanup() {
+            sudo systemctl stop siyan-settlement-666.service 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          sudo useradd --system --user-group --home-dir /var/lib/siyan-settlement-666 \
+            --create-home --shell /usr/sbin/nologin siyan-settlement-666
+          sudo install -d -o root -g siyan-settlement-666 -m 0750 \
+            "${release_target}" \
+            /opt/siyan-settlement-666/runtime/node/bin \
+            /etc/siyan-settlement-666
+          sudo cp -a "${release_dir}/." "${release_target}/"
+          sudo chown -R root:siyan-settlement-666 "${release_target}"
+          sudo chmod -R u=rwX,g=rX,o= "${release_target}"
+          sudo ln -s "${release_target}" /opt/siyan-settlement-666/current
+          sudo ln -s "$(command -v node)" /opt/siyan-settlement-666/runtime/node/bin/node
+          printf '%s\n' \
+            'NODE_ENV=development' \
+            'HOST=0.0.0.0' \
+            'PORT=1' \
+            'SEED_DEMO=true' \
+            'PUBLIC_ORIGIN=http://untrusted.example' \
+            'DATABASE_URL=postgresql://settlement_ci:settlement_ci_password@127.0.0.1:5432/settlement_ci' | \
+            sudo tee /etc/siyan-settlement-666/app.env >/dev/null
+          sudo chown root:siyan-settlement-666 /etc/siyan-settlement-666/app.env
+          sudo chmod 0640 /etc/siyan-settlement-666/app.env
+          sudo install -m 0644 \
+            "${release_target}/deploy/systemd/siyan-settlement-666.service" \
+            /etc/systemd/system/siyan-settlement-666.service
+          sudo systemctl daemon-reload
+          sudo systemctl start siyan-settlement-666.service
+
+          healthy=false
+          for _attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:16666/api/health >/dev/null; then
+              healthy=true
+              break
+            fi
+            sudo systemctl is-active --quiet siyan-settlement-666.service || break
+            sleep 1
+          done
+          if [[ "${healthy}" != true ]]; then
+            sudo systemctl status siyan-settlement-666.service --no-pager || true
+            sudo journalctl -u siyan-settlement-666.service --no-pager
+            exit 1
+          fi
+
+          ss -lnt | awk '$4 == "127.0.0.1:16666" { found=1 } END { exit !found }'
+          curl --fail --silent http://127.0.0.1:16666/ >/dev/null
+          sudo systemctl stop siyan-settlement-666.service
+          test "$(sudo systemctl show -p Result --value siyan-settlement-666.service)" = success
+          sudo journalctl -u siyan-settlement-666.service --no-pager \
+            | grep -F 'graceful shutdown completed'
+
+  deployment-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: settlement_ci
+          POSTGRES_PASSWORD: settlement_ci_password
+          POSTGRES_DB: settlement_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username=settlement_ci --dbname=settlement_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Use Node.js 24.18.0
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+
+      - name: Install configuration validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes age nginx postgresql-client rclone shellcheck
+
+      - name: Validate backup script
+        run: |
+          for script in deploy/scripts/*.sh; do
+            bash -n "${script}"
+            shellcheck "${script}"
+          done
+
+      - name: Validate systemd units
+        run: |
+          sudo useradd --system --user-group --home-dir /var/lib/siyan-settlement-666 \
+            --shell /usr/sbin/nologin siyan-settlement-666
+          sudo install -d -o root -g siyan-settlement-666 -m 0750 \
+            /opt/siyan-settlement-666/current/dist/src \
+            /opt/siyan-settlement-666/current/deploy/scripts \
+            /opt/siyan-settlement-666/runtime/node/bin \
+            /etc/siyan-settlement-666
+          sudo install -d -o siyan-settlement-666 -g siyan-settlement-666 -m 0700 \
+            /var/backups/siyan-settlement-666
+          sudo install -m 0755 deploy/scripts/siyan-settlement-666-postgres-backup.sh \
+            /opt/siyan-settlement-666/current/deploy/scripts/siyan-settlement-666-postgres-backup.sh
+          printf '%s\n' \
+            'NODE_ENV=development' \
+            'HOST=0.0.0.0' \
+            'PORT=1' \
+            'SEED_DEMO=true' \
+            'PUBLIC_ORIGIN=http://untrusted.example' \
+            'DATABASE_URL=postgresql://example:example@127.0.0.1/example' | \
+            sudo tee /etc/siyan-settlement-666/app.env >/dev/null
+          sudo chown root:siyan-settlement-666 /etc/siyan-settlement-666/app.env
+          sudo chmod 0640 /etc/siyan-settlement-666/app.env
+          printf 'age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqd3q2du\n' | \
+            sudo tee /etc/siyan-settlement-666/backup.age-recipient >/dev/null
+          sudo install -m 0640 -o root -g siyan-settlement-666 /dev/null \
+            /etc/siyan-settlement-666/rclone.conf
+          sudo touch /opt/siyan-settlement-666/current/dist/src/server.js
+          sudo ln -s "$(command -v node)" /opt/siyan-settlement-666/runtime/node/bin/node
+          sudo systemd-analyze verify deploy/systemd/*.service deploy/systemd/*.timer
+
+      - name: Create, encrypt, copy, and restore a real PostgreSQL backup
+        env:
+          PGPASSWORD: settlement_ci_password
+        run: |
+          psql --host=127.0.0.1 --username=settlement_ci --dbname=settlement_ci \
+            --set ON_ERROR_STOP=1 <<'SQL'
+          CREATE TABLE backup_ci_probe (id integer PRIMARY KEY, value text NOT NULL);
+          INSERT INTO backup_ci_probe (id, value) VALUES (1, '中文'), (2, 'مرحبا');
+          SQL
+
+          age-keygen -o "${RUNNER_TEMP}/backup-ci.agekey"
+          age-keygen -y "${RUNNER_TEMP}/backup-ci.agekey" | \
+            sudo tee /etc/siyan-settlement-666/backup.age-recipient >/dev/null
+          sudo chown root:siyan-settlement-666 /etc/siyan-settlement-666/backup.age-recipient
+          sudo chmod 0640 /etc/siyan-settlement-666/backup.age-recipient
+          printf '[offsite]\ntype = local\n' | \
+            sudo tee /etc/siyan-settlement-666/rclone.conf >/dev/null
+          sudo chown root:siyan-settlement-666 /etc/siyan-settlement-666/rclone.conf
+          sudo chmod 0640 /etc/siyan-settlement-666/rclone.conf
+          sudo install -d -o siyan-settlement-666 -g siyan-settlement-666 -m 0700 \
+            /var/tmp/siyan-settlement-666-ci-offsite
+
+          sudo -u siyan-settlement-666 /usr/bin/env \
+            DATABASE_URL=postgresql://settlement_ci:settlement_ci_password@127.0.0.1:5432/settlement_ci \
+            BACKUP_REMOTE=offsite:/var/tmp/siyan-settlement-666-ci-offsite \
+            BACKUP_RETENTION_DAYS=30 \
+            /usr/bin/bash \
+            /opt/siyan-settlement-666/current/deploy/scripts/siyan-settlement-666-postgres-backup.sh
+
+          sudo -u siyan-settlement-666 /usr/bin/bash -c \
+            'cd /var/backups/siyan-settlement-666 && sha256sum -c -- *.dump.age.sha256'
+          remote_backup="$(sudo find /var/tmp/siyan-settlement-666-ci-offsite \
+            -type f -name 'siyan-settlement-666-*.dump.age' -print -quit)"
+          test -n "${remote_backup}"
+          sudo test -f "${remote_backup}.sha256"
+          sudo age --decrypt -i "${RUNNER_TEMP}/backup-ci.agekey" "${remote_backup}" | \
+            pg_restore --list >/dev/null
+
+          createdb --host=127.0.0.1 --username=settlement_ci settlement_restore
+          sudo age --decrypt -i "${RUNNER_TEMP}/backup-ci.agekey" "${remote_backup}" | \
+            pg_restore --host=127.0.0.1 --username=settlement_ci \
+              --dbname=settlement_restore --exit-on-error --no-owner --no-privileges
+          test "$(psql --host=127.0.0.1 --username=settlement_ci \
+            --dbname=settlement_restore --tuples-only --no-align \
+            --command='SELECT count(*) FROM backup_ci_probe')" = 2
+
+      - name: Validate Nginx configuration
+        run: |
+          sudo install -d -m 0755 /etc/letsencrypt/live/123.56.254.236
+          sudo openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -subj '/CN=123.56.254.236' \
+            -addext 'subjectAltName=IP:123.56.254.236' \
+            -keyout /etc/letsencrypt/live/123.56.254.236/privkey.pem \
+            -out /etc/letsencrypt/live/123.56.254.236/fullchain.pem
+          sudo install -m 0644 deploy/nginx/siyan-settlement-666.conf \
+            /etc/nginx/conf.d/siyan-settlement-666.conf
+          sudo deploy/scripts/siyan-settlement-666-nginx-cert-reload.sh --check-only

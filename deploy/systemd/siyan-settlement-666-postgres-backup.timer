@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily encrypted PostgreSQL backup for Siyan Settlement 666
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=15m
+AccuracySec=1m
+Unit=siyan-settlement-666-postgres-backup.service
+
+[Install]
+WantedBy=timers.target

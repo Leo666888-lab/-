@@ -1,0 +1,53 @@
+[Unit]
+Description=Encrypted PostgreSQL backup for Siyan Settlement 666
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/var/backups/siyan-settlement-666
+
+[Service]
+Type=oneshot
+User=siyan-settlement-666
+Group=siyan-settlement-666
+WorkingDirectory=/var/backups/siyan-settlement-666
+EnvironmentFile=/etc/siyan-settlement-666/app.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+
+ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/app.env
+ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/backup.age-recipient
+ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/rclone.conf
+ExecStartPre=/usr/bin/test -w /var/backups/siyan-settlement-666
+ExecStart=/usr/bin/bash /opt/siyan-settlement-666/current/deploy/scripts/siyan-settlement-666-postgres-backup.sh
+
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=true
+ReadOnlyPaths=/etc/siyan-settlement-666 /opt/siyan-settlement-666/current
+ReadWritePaths=/var/backups/siyan-settlement-666
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=siyan-settlement-666-postgres-backup
