@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Siyan Settlement 666 health checks every minute
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=1m
+RandomizedDelaySec=10s
+AccuracySec=10s
+Unit=siyan-settlement-666-health-check.service
+
+[Install]
+WantedBy=timers.target

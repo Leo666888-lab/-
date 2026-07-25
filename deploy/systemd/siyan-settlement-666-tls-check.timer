@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily TLS expiry and renewal evidence check for Siyan Settlement 666
+
+[Timer]
+OnCalendar=*-*-* 06:15:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=30m
+AccuracySec=1m
+Unit=siyan-settlement-666-tls-check.service
+
+[Install]
+WantedBy=timers.target

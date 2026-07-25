@@ -9,6 +9,9 @@ readonly NGINX_CONFIG_FILE="/etc/nginx/conf.d/siyan-settlement-666.conf"
 readonly EXPECTED_IP="123.56.254.236"
 readonly EXPECTED_PORT="666"
 readonly MINIMUM_VALIDITY_SECONDS="86400"
+readonly RENEWAL_STAMP_DIR="/var/lib/siyan-settlement-666-tls"
+readonly RENEWAL_STAMP_FILE="${RENEWAL_STAMP_DIR}/renewal-last-success"
+readonly MONITOR_GROUP="siyan-settlement-666-monitor"
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -23,7 +26,7 @@ for command_name in nginx openssl sha256sum; do
   command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
 done
 if [[ -z "${mode}" ]]; then
-  for command_name in systemctl timeout; do
+  for command_name in chmod chown date getent install mktemp mv rm systemctl timeout; do
     command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
   done
   [[ ${EUID} -eq 0 ]] || die "certificate reload hook must run as root"
@@ -74,5 +77,21 @@ served_certificate="$(
 served_fingerprint="$(printf '%s\n' "${served_certificate}" | openssl x509 -noout -fingerprint -sha256)"
 [[ "${served_fingerprint}" == "${expected_fingerprint}" ]] \
   || die "Nginx is not serving the renewed certificate on port ${EXPECTED_PORT}"
+
+getent group "${MONITOR_GROUP}" >/dev/null 2>&1 || die "monitor group does not exist: ${MONITOR_GROUP}"
+install -d -o root -g "${MONITOR_GROUP}" -m 0750 "${RENEWAL_STAMP_DIR}"
+stamp_temp="$(mktemp "${RENEWAL_STAMP_DIR}/.renewal-last-success.XXXXXX")"
+cleanup_stamp() {
+  if [[ -n "${stamp_temp:-}" && -e "${stamp_temp}" ]]; then
+    rm -f -- "${stamp_temp}"
+  fi
+}
+trap cleanup_stamp EXIT
+printf 'verified_at=%s\nfingerprint=%s\n' \
+  "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${expected_fingerprint}" > "${stamp_temp}"
+chown root:"${MONITOR_GROUP}" "${stamp_temp}"
+chmod 0640 "${stamp_temp}"
+mv -- "${stamp_temp}" "${RENEWAL_STAMP_FILE}"
+stamp_temp=""
 
 printf 'Nginx reloaded and renewed certificate verified on port %s\n' "${EXPECTED_PORT}"

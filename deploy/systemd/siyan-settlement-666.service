@@ -2,6 +2,7 @@
 Description=Siyan Settlement 666 application
 Wants=network-online.target
 After=network-online.target
+OnFailure=siyan-settlement-666-alert@%n.service
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -9,10 +10,11 @@ StartLimitBurst=5
 Type=simple
 User=siyan-settlement-666
 Group=siyan-settlement-666
+SupplementaryGroups=siyan-settlement-666-release
 WorkingDirectory=/opt/siyan-settlement-666/current
-EnvironmentFile=/etc/siyan-settlement-666/app.env
+EnvironmentFile=/etc/siyan-settlement-666/app/app.env
 
-ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/app.env
+ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/app/app.env
 ExecStartPre=/usr/bin/test -r /opt/siyan-settlement-666/current/dist/src/server.js
 ExecStartPre=/usr/bin/test -x /opt/siyan-settlement-666/runtime/node/bin/node
 ExecStartPre=/usr/bin/test -x /usr/bin/env
@@ -31,6 +33,7 @@ UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
+PrivateMounts=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectHostname=true
@@ -46,11 +49,14 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+KeyringMode=private
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 AmbientCapabilities=
 RemoveIPC=true
 ReadWritePaths=/var/lib/siyan-settlement-666
+ReadOnlyPaths=/etc/siyan-settlement-666/app /opt/siyan-settlement-666/current
+InaccessiblePaths=/etc/siyan-settlement-666/backup /etc/siyan-settlement-666/monitor /var/backups/siyan-settlement-666
 LimitNOFILE=65536
 TasksMax=256
 

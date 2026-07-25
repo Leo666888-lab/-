@@ -18,7 +18,7 @@ export async function seedDemo(database: Database): Promise<void> {
     await tx.query(
       `INSERT INTO tenants (id, name) VALUES ($1, $2)
        ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
-      [DEMO_IDS.tenant, "义乌思言贸易"],
+      [DEMO_IDS.tenant, "义乌市糖安贸易有限公司"],
     );
     await tx.query(
       `INSERT INTO users (id, phone, display_name, password_hash)

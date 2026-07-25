@@ -11,6 +11,28 @@ const FULFILLMENT_STATUSES = new Set(["planned", "fulfilled", "cancelled"]);
 const SETTLEMENT_STATUSES = new Set(["planned", "awaiting", "partial", "settled", "cancelled"]);
 const ROLES = new Set(["owner", "finance", "sales", "viewer"]);
 const PARTNER_KINDS = new Set(["customer", "supplier", "both"]);
+const LOCAL_FILE_RULES = {
+  import: {
+    extensions: new Set(["csv", "xlsx"]),
+    mimeTypes: new Set([
+      "application/csv",
+      "application/vnd.ms-excel",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "text/csv",
+      "text/plain"
+    ]),
+    maxBytes: 10 * 1024 * 1024,
+    supportedLabel: "CSV 或 XLSX",
+    tooLargeLabel: "10 MB"
+  },
+  ocr: {
+    extensions: new Set(["jpeg", "jpg", "png", "webp"]),
+    mimeTypes: new Set(["image/jpeg", "image/png", "image/webp"]),
+    maxBytes: 10 * 1024 * 1024,
+    supportedLabel: "JPG、PNG 或 WebP",
+    tooLargeLabel: "10 MB"
+  }
+};
 
 export function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => HTML_ENTITIES[character]);
@@ -18,6 +40,42 @@ export function escapeHtml(value) {
 
 export function escapeAttr(value) {
   return escapeHtml(value);
+}
+
+export function formatFileSize(bytes) {
+  const size = Number(bytes);
+  if (!Number.isFinite(size) || size < 0) return "0 B";
+  if (size < 1024) return `${Math.round(size)} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+export function validateLocalFile(file = {}, purpose = "import") {
+  const rules = LOCAL_FILE_RULES[purpose];
+  if (!rules) throw new Error("不支持的本地文件用途");
+
+  const name = asText(file.name).trim();
+  const size = Number(file.size);
+  const mimeType = asText(file.type).trim().toLowerCase();
+  const extension = name.includes(".") ? name.split(".").at(-1).toLowerCase() : "";
+  const result = {
+    accepted: false,
+    name,
+    extension,
+    mimeType,
+    size: Number.isFinite(size) && size >= 0 ? size : 0,
+    sizeLabel: formatFileSize(size)
+  };
+
+  if (!name) return { ...result, message: "请选择文件" };
+  if (!rules.extensions.has(extension)) return { ...result, message: `仅支持 ${rules.supportedLabel} 文件` };
+  if (!Number.isFinite(size) || size <= 0) return { ...result, message: "文件为空或无法读取" };
+  if (size > rules.maxBytes) return { ...result, message: `文件不能超过 ${rules.tooLargeLabel}` };
+
+  const genericMime = !mimeType || mimeType === "application/octet-stream";
+  const mimeAccepted = purpose === "ocr" ? rules.mimeTypes.has(mimeType) : genericMime || rules.mimeTypes.has(mimeType);
+  if (!mimeAccepted) return { ...result, message: "文件类型与扩展名不一致" };
+  return { ...result, accepted: true, message: "文件基本信息已在本地确认" };
 }
 
 export function asText(value, fallback = "") {
@@ -36,6 +94,7 @@ export function normalizeOrder(raw = {}) {
   const paidCents = Math.min(totalCents, asCents(raw.paidCents));
   return {
     id: asText(raw.id),
+    version: Math.max(1, Number.parseInt(raw.version, 10) || 1),
     partnerId: asText(raw.partnerId),
     partnerName: asText(raw.partnerName, "未命名往来单位"),
     orderNo: asText(raw.orderNo, "未编号"),
@@ -56,7 +115,21 @@ export function normalizeOrder(raw = {}) {
     createdAt: asText(raw.createdAt),
     updatedAt: asText(raw.updatedAt),
     items: Array.isArray(raw.items) ? raw.items.map(normalizeItem) : [],
-    payments: Array.isArray(raw.payments) ? raw.payments.map(normalizePayment) : []
+    payments: Array.isArray(raw.payments) ? raw.payments.map(normalizePayment) : [],
+    corrections: Array.isArray(raw.corrections) ? raw.corrections.map(normalizeCorrection) : []
+  };
+}
+
+export function normalizeCorrection(raw = {}) {
+  return {
+    id: asText(raw.id),
+    reason: asText(raw.reason),
+    changedFields: Array.isArray(raw.changedFields) ? raw.changedFields.map(asText).filter(Boolean) : [],
+    correctedBy: asText(raw.correctedBy),
+    correctedByName: asText(raw.correctedByName, "系统"),
+    fromVersion: Math.max(1, Number.parseInt(raw.fromVersion, 10) || 1),
+    toVersion: Math.max(1, Number.parseInt(raw.toVersion, 10) || 1),
+    createdAt: asText(raw.createdAt)
   };
 }
 
@@ -115,6 +188,21 @@ export function normalizeReminder(raw = {}) {
   };
 }
 
+export function normalizeRecentPayment(raw = {}) {
+  return {
+    id: asText(raw.id),
+    orderId: asText(raw.orderId),
+    orderNo: asText(raw.orderNo, "未编号"),
+    partnerName: asText(raw.partnerName, "未命名往来单位"),
+    direction: DIRECTIONS.has(raw.direction) ? raw.direction : "receivable",
+    currency: /^[A-Z]{3}$/.test(asText(raw.currency)) ? raw.currency : "CNY",
+    amountCents: asCents(raw.amountCents),
+    method: asText(raw.method),
+    paidAt: asText(raw.paidAt),
+    reversedAt: asText(raw.reversedAt)
+  };
+}
+
 export function normalizeBootstrap(raw = {}) {
   return {
     user: {
@@ -130,7 +218,8 @@ export function normalizeBootstrap(raw = {}) {
     role: ROLES.has(raw.role) ? raw.role : "viewer",
     orders: Array.isArray(raw.orders) ? raw.orders.map(normalizeOrder) : [],
     partners: Array.isArray(raw.partners) ? raw.partners.map(normalizePartner) : [],
-    reminders: Array.isArray(raw.reminders) ? raw.reminders.map(normalizeReminder) : []
+    reminders: Array.isArray(raw.reminders) ? raw.reminders.map(normalizeReminder) : [],
+    recentPayments: Array.isArray(raw.recentPayments) ? raw.recentPayments.map(normalizeRecentPayment) : []
   };
 }
 
@@ -168,7 +257,12 @@ export function yuanToCents(value) {
 }
 
 export function settlementRequest(value, customDays = 0) {
-  if (value === "months:3") return { settlementDays: 0, settlementMonths: 3 };
+  const monthMatch = /^months:(\d{1,3})$/.exec(asText(value));
+  if (monthMatch) {
+    const months = Number(monthMatch[1]);
+    if (months < 1 || months > 120) throw new Error("月数账期必须是 1 到 120 个月");
+    return { settlementDays: 0, settlementMonths: months };
+  }
   if (value === "custom") {
     const days = Number(customDays);
     if (!Number.isInteger(days) || days < 0 || days > 3650) throw new Error("自定义账期必须是 0 到 3650 天");
@@ -186,18 +280,20 @@ export function roleCan(role, action) {
     payment: ["owner", "finance"],
     reversePayment: ["owner", "finance"],
     cancelOrder: ["owner", "finance", "sales"],
+    correctOrder: ["owner", "finance", "sales"],
     reminder: ["owner", "finance", "sales"],
     partner: ["owner", "finance", "sales"]
   };
   return (permissions[action] ?? []).includes(role);
 }
 
-export function orderStatus(order) {
+export function orderStatus(order, options = {}) {
+  const isOverdue = options.isOverdue ?? Boolean(order.dueAt && new Date(order.dueAt).getTime() < Date.now());
   if (order.fulfillmentStatus === "cancelled") return { label: "已取消", className: "draft" };
   if (order.fulfillmentStatus === "planned") return { label: "待交货", className: "draft" };
   if (order.settlementStatus === "settled" || order.outstandingCents === 0) return { label: "已结清", className: "settled" };
+  if (isOverdue) return { label: "已逾期", className: "overdue" };
   if (order.settlementStatus === "partial") return { label: "部分结算", className: "partial" };
-  if (order.dueAt && new Date(order.dueAt).getTime() < Date.now()) return { label: "已逾期", className: "overdue" };
   return { label: "待结算", className: "pending" };
 }
 
@@ -253,10 +349,9 @@ export function toDateTimeInputValue(value = new Date(), timeZone = "Asia/Shangh
   return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
 }
 
-export function addDaysToDateInput(value, days) {
+function dateInputMilliseconds(value) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(asText(value));
-  const amount = Number(days);
-  if (!match || !Number.isInteger(amount)) throw new Error("请选择有效日期");
+  if (!match) throw new Error("请选择有效日期");
   const year = Number(match[1]);
   const month = Number(match[2]) - 1;
   const day = Number(match[3]);
@@ -264,8 +359,27 @@ export function addDaysToDateInput(value, days) {
   if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month || date.getUTCDate() !== day) {
     throw new Error("请选择有效日期");
   }
+  return date.getTime();
+}
+
+export function addDaysToDateInput(value, days) {
+  const amount = Number(days);
+  if (!Number.isInteger(amount)) throw new Error("请选择有效日期");
+  const date = new Date(dateInputMilliseconds(value));
   date.setUTCDate(date.getUTCDate() + amount);
   return date.toISOString().slice(0, 10);
+}
+
+export function daysBetweenDateInputs(fromValue, toValue) {
+  return Math.round((dateInputMilliseconds(toValue) - dateInputMilliseconds(fromValue)) / 86_400_000);
+}
+
+export function dueBucketForDateInputs(dueValue, todayValue) {
+  if (!dueValue) return "later";
+  const days = daysBetweenDateInputs(todayValue, dueValue);
+  if (days < 0) return "overdue";
+  if (days === 0) return "today";
+  return days <= 7 ? "upcoming" : "later";
 }
 
 export function toIsoDateTime(localValue, timeZone = "Asia/Shanghai") {

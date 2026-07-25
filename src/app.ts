@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
@@ -6,15 +6,20 @@ import fastifyStatic from "@fastify/static";
 import bcrypt from "bcryptjs";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
+import { NoopCache, type Cache, type FixedWindowResult, type FixedWindowRule } from "./cache/index.js";
 import type { Database, Queryable } from "./db/types.js";
 import { writeAudit } from "./lib/audit.js";
 import { ApiError } from "./lib/errors.js";
+import { OrderImportFileError, parseOrderImport, type OrderImportMapping } from "./lib/order-import.js";
 import { hashSessionToken, newId, newSessionToken } from "./lib/security.js";
 
 const roleSchema = z.enum(["owner", "finance", "sales", "viewer"]);
 type Role = z.infer<typeof roleSchema>;
 const SESSION_COOKIE_NAME = "settlement_session";
 const PAYMENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const FULFILLMENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const MEMBER_INVITATION_TTL_MS = 72 * 60 * 60 * 1000;
+const LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60;
 const COOKIE_ORIGIN_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 interface AuthContext {
@@ -30,12 +35,14 @@ interface AuthContext {
 
 interface AppOptions {
   database: Database;
+  cache?: Cache;
   sessionTtlHours?: number;
   closeDatabase?: boolean;
   logger?: boolean;
   isProduction?: boolean;
   bodyLimitBytes?: number;
   loginRateLimitMax?: number;
+  loginRateLimitIpMax?: number;
   publicOrigin?: string;
   serveStatic?: boolean;
   staticRoot?: string;
@@ -43,6 +50,11 @@ interface AppOptions {
 
 function normalizePhone(value: string): string {
   return value.trim();
+}
+
+function loginRateLimitKey(scope: "ip" | "phone" | "ip-phone", value: string): string {
+  const digest = createHash("sha256").update(`login:${scope}\0${value}`).digest("hex");
+  return `rate-limit:login:${scope}:${digest}`;
 }
 
 const loginSchema = z.object({
@@ -76,7 +88,55 @@ const createOrderSchema = z.object({
 }).strict().refine((value) => value.settlementDays === 0 || value.settlementMonths === 0, {
   message: "天数账期与月数账期不能同时设置",
   path: ["settlementMonths"],
+}).refine((value) => !value.plannedDeliveryDate || value.plannedDeliveryDate >= value.orderDate, {
+  message: "计划交货日期不能早于订货日期",
+  path: ["plannedDeliveryDate"],
 });
+
+const updateOrderSchema = z.object({
+  version: z.number().int().positive(),
+  reason: z.string().trim().min(1).max(2000),
+  partnerId: z.uuid(),
+  orderNo: z.string().trim().min(1).max(100),
+  direction: z.enum(["receivable", "payable"]),
+  orderDate: z.iso.date(),
+  plannedDeliveryDate: z.iso.date().nullable().optional(),
+  fulfilledAt: z.iso.datetime({ offset: true }).nullable().optional(),
+  settlementDays: z.number().int().min(0).max(3650).default(0),
+  settlementMonths: z.number().int().min(0).max(120).default(0),
+  currency: z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/),
+  notes: z.string().trim().max(2000).nullable().optional(),
+  items: z.array(itemSchema).min(1).max(500),
+}).strict().refine((value) => value.settlementDays === 0 || value.settlementMonths === 0, {
+  message: "天数账期与月数账期不能同时设置",
+  path: ["settlementMonths"],
+}).refine((value) => !value.plannedDeliveryDate || value.plannedDeliveryDate >= value.orderDate, {
+  message: "计划交货日期不能早于订货日期",
+  path: ["plannedDeliveryDate"],
+});
+
+const orderImportMappingSchema = z.object({
+  partnerName: z.number().int().positive().optional(),
+  orderNo: z.number().int().positive().optional(),
+  direction: z.number().int().positive().optional(),
+  orderDate: z.number().int().positive().optional(),
+  plannedDeliveryDate: z.number().int().positive().optional(),
+  settlementMonths: z.number().int().positive().optional(),
+  currency: z.number().int().positive().optional(),
+  itemDescription: z.number().int().positive().optional(),
+  quantity: z.number().int().positive().optional(),
+  unitPrice: z.number().int().positive().optional(),
+}).strict();
+
+const orderImportFileSchema = z.object({
+  fileName: z.string().trim().min(1).max(255),
+  contentBase64: z.string().min(1).max(14_000_000),
+  mapping: orderImportMappingSchema.optional(),
+}).strict();
+
+const commitOrderImportSchema = orderImportFileSchema.extend({
+  rowNumbers: z.array(z.number().int().min(2).max(10_001)).min(1).max(1_000).optional(),
+}).strict();
 
 const paymentSchema = z.object({
   amountCents: z.number().int().positive().max(9_000_000_000_000),
@@ -120,6 +180,25 @@ const updatePartnerSchema = z.object({
   { message: "至少提供一个需要修改的字段" },
 );
 
+const createMemberSchema = z.object({
+  phone: z.string().transform(normalizePhone).pipe(z.string().min(5).max(32)),
+  displayName: z.string().trim().min(1).max(100),
+  role: roleSchema,
+}).strict();
+
+const acceptMemberInvitationSchema = z.object({
+  token: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  password: z.string().min(12).max(128),
+}).strict();
+
+const updateMemberRoleSchema = z.object({
+  role: roleSchema,
+}).strict();
+
+const updateMemberStatusSchema = z.object({
+  active: z.boolean(),
+}).strict();
+
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (!result.success) {
@@ -132,6 +211,70 @@ function money(value: unknown): number {
   const parsed = Number(value ?? 0);
   if (!Number.isSafeInteger(parsed)) throw new ApiError(500, "UNSAFE_MONEY_VALUE", "金额超出安全范围");
   return parsed;
+}
+
+function calculateOrderItems(items: Array<z.infer<typeof itemSchema>>) {
+  const calculatedItems = items.map((item) => {
+    const lineTotalCents = item.quantity * item.unitPriceCents;
+    if (!Number.isSafeInteger(lineTotalCents)) {
+      throw new ApiError(400, "AMOUNT_TOO_LARGE", "商品金额超出安全范围");
+    }
+    return { ...item, lineTotalCents };
+  });
+  const totalCents = calculatedItems.reduce((sum, item) => sum + item.lineTotalCents, 0);
+  if (!Number.isSafeInteger(totalCents) || totalCents <= 0) {
+    throw new ApiError(400, "INVALID_TOTAL", "订单总额必须大于 0 且不能超出安全范围");
+  }
+  return { calculatedItems, totalCents };
+}
+
+function decodeOrderImportContent(contentBase64: string): Buffer {
+  if (contentBase64.length % 4 !== 0
+      || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(contentBase64)) {
+    throw new ApiError(400, "INVALID_FILE_ENCODING", "导入文件编码无效");
+  }
+  const buffer = Buffer.from(contentBase64, "base64");
+  if (!buffer.length || buffer.toString("base64") !== contentBase64) {
+    throw new ApiError(400, "INVALID_FILE_ENCODING", "导入文件编码无效");
+  }
+  return buffer;
+}
+
+async function inspectOrderImport(
+  buffer: Buffer,
+  fileName: string,
+  mapping: OrderImportMapping | undefined,
+  existingOrderNumbers: Iterable<string>,
+  allowIncompleteMapping = false,
+) {
+  try {
+    return await parseOrderImport(buffer, {
+      fileName,
+      mapping,
+      allowIncompleteMapping,
+      existingOrderNumbers,
+      limits: { maxRows: 1_000 },
+    });
+  } catch (error) {
+    if (error instanceof OrderImportFileError) {
+      throw new ApiError(400, error.code, error.message, error.details);
+    }
+    throw error;
+  }
+}
+
+function orderImportRequestHash(
+  buffer: Buffer,
+  fileName: string,
+  mapping: OrderImportMapping | undefined,
+  rowNumbers: number[] | undefined,
+): string {
+  return createHash("sha256").update(JSON.stringify({
+    fileName,
+    fileHash: createHash("sha256").update(buffer).digest("hex"),
+    mapping: mapping ?? {},
+    rowNumbers: rowNumbers ? [...rowNumbers].sort((left, right) => left - right) : null,
+  })).digest("hex");
 }
 
 function iso(value: unknown): string | null {
@@ -229,6 +372,90 @@ async function authenticate(database: Database, request: FastifyRequest, publicO
   };
 }
 
+function memberInvitationHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function mapMember(row: Record<string, unknown>) {
+  const active = row.is_active === true;
+  const invitationId = row.invitation_id ? String(row.invitation_id) : null;
+  const acceptedAt = iso(row.invitation_accepted_at);
+  const revokedAt = iso(row.invitation_revoked_at);
+  const expiresAt = iso(row.invitation_expires_at);
+  const invitationStatus = !invitationId
+    ? null
+    : acceptedAt
+      ? "accepted"
+      : revokedAt
+        ? "revoked"
+        : expiresAt && new Date(expiresAt).getTime() <= Date.now()
+          ? "expired"
+          : "pending";
+  return {
+    id: row.user_id,
+    phone: row.phone,
+    displayName: row.display_name,
+    role: roleSchema.parse(row.role),
+    active,
+    status: active
+      ? "active"
+      : invitationStatus === "pending"
+        ? "invited"
+        : invitationStatus === "expired"
+          ? "invitation_expired"
+          : "inactive",
+    createdAt: iso(row.membership_created_at),
+    invitation: invitationId ? {
+      status: invitationStatus,
+      expiresAt,
+      acceptedAt,
+      revokedAt,
+    } : null,
+  };
+}
+
+async function listMembers(database: Queryable, tenantId: string) {
+  const result = await database.query(
+    `SELECT u.id AS user_id, u.phone, u.display_name, m.role, m.is_active,
+            m.created_at AS membership_created_at,
+            invitation.id AS invitation_id,
+            invitation.expires_at AS invitation_expires_at,
+            invitation.accepted_at AS invitation_accepted_at,
+            invitation.revoked_at AS invitation_revoked_at
+     FROM memberships m
+     JOIN users u ON u.id = m.user_id
+     LEFT JOIN member_invitations invitation
+       ON invitation.tenant_id = m.tenant_id
+      AND invitation.user_id = m.user_id
+     WHERE m.tenant_id = $1
+     ORDER BY m.created_at, u.id`,
+    [tenantId],
+  );
+  return result.rows.map(mapMember);
+}
+
+async function getMemberView(database: Queryable, tenantId: string, userId: string) {
+  const member = (await listMembers(database, tenantId)).find((item) => item.id === userId);
+  if (!member) throw new ApiError(404, "MEMBER_NOT_FOUND", "成员不存在");
+  return member;
+}
+
+async function lockTenantForMemberMutation(database: Queryable, tenantId: string): Promise<void> {
+  const tenant = await database.query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE", [tenantId]);
+  if (!tenant.rowCount) throw new ApiError(404, "TENANT_NOT_FOUND", "企业不存在");
+}
+
+async function requireAnotherActiveOwner(database: Queryable, tenantId: string): Promise<void> {
+  const owners = await database.query<{ count: string }>(
+    `SELECT COUNT(*)::text AS count FROM memberships
+     WHERE tenant_id = $1 AND role = 'owner' AND is_active = true`,
+    [tenantId],
+  );
+  if (Number(owners.rows[0]?.count) <= 1) {
+    throw new ApiError(409, "LAST_OWNER_REQUIRED", "企业必须保留至少一名启用中的负责人");
+  }
+}
+
 function mapOrder(row: Record<string, unknown>) {
   const totalCents = money(row.total_cents);
   const paidCents = money(row.paid_cents);
@@ -244,6 +471,7 @@ function mapOrder(row: Record<string, unknown>) {
           : "settled";
   return {
     id: row.id,
+    version: Number(row.version ?? 1),
     partnerId: row.partner_id,
     partnerName: row.partner_name,
     orderNo: row.order_no,
@@ -267,7 +495,7 @@ function mapOrder(row: Record<string, unknown>) {
 }
 
 const orderSelect = `
-  SELECT o.id, o.partner_id, p.name AS partner_name, o.order_no, o.direction, o.order_date,
+  SELECT o.id, o.version, o.partner_id, p.name AS partner_name, o.order_no, o.direction, o.order_date,
          o.planned_delivery_date, o.fulfillment_status, o.fulfilled_at, o.settlement_days, o.settlement_months,
          o.due_at, o.currency, o.total_cents::text, o.notes, o.created_at, o.updated_at,
          COALESCE(SUM(CASE WHEN reversal.id IS NULL THEN pay.amount_cents ELSE 0 END), 0)::text AS paid_cents
@@ -282,7 +510,7 @@ const orderSelect = `
 
 async function getOrder(database: Queryable, auth: AuthContext, orderId: string) {
   const orderResult = await database.query(
-    `SELECT o.id, o.partner_id, p.name AS partner_name, o.order_no, o.direction, o.order_date,
+    `SELECT o.id, o.version, o.partner_id, p.name AS partner_name, o.order_no, o.direction, o.order_date,
             o.planned_delivery_date, o.fulfillment_status, o.fulfilled_at, o.settlement_days,
             o.settlement_months, o.due_at, o.currency, o.total_cents::text, o.notes,
             o.created_at, o.updated_at,
@@ -332,7 +560,24 @@ async function getOrder(database: Queryable, auth: AuthContext, orderId: string)
                AND reversal.payment_id = pay.id
                AND reversal.order_id = pay.order_id
               WHERE pay.tenant_id = o.tenant_id AND pay.order_id = o.id
-            ), '[]'::jsonb) AS payments
+            ), '[]'::jsonb) AS payments,
+            COALESCE((
+              SELECT jsonb_agg(
+                jsonb_build_object(
+                  'id', correction.id,
+                  'reason', correction.reason,
+                  'changedFields', correction.changed_fields,
+                  'correctedBy', correction.corrected_by,
+                  'correctedByName', correcting_user.display_name,
+                  'fromVersion', correction.before_snapshot ->> 'version',
+                  'toVersion', correction.after_snapshot ->> 'version',
+                  'createdAt', correction.created_at
+                ) ORDER BY correction.created_at DESC, correction.id DESC
+              )
+              FROM order_corrections correction
+              LEFT JOIN users correcting_user ON correcting_user.id = correction.corrected_by
+              WHERE correction.tenant_id = o.tenant_id AND correction.order_id = o.id
+            ), '[]'::jsonb) AS corrections
      FROM orders o
      JOIN partners p ON p.tenant_id = o.tenant_id AND p.id = o.partner_id
      WHERE o.tenant_id = $1 AND o.id = $2`,
@@ -342,6 +587,7 @@ async function getOrder(database: Queryable, auth: AuthContext, orderId: string)
   if (!row) throw new ApiError(404, "NOT_FOUND", "订单不存在");
   const items = Array.isArray(row.items) ? row.items as Record<string, unknown>[] : [];
   const payments = Array.isArray(row.payments) ? row.payments as Record<string, unknown>[] : [];
+  const corrections = Array.isArray(row.corrections) ? row.corrections as Record<string, unknown>[] : [];
   return {
     ...mapOrder(row),
     items: items.map((item) => ({
@@ -362,6 +608,16 @@ async function getOrder(database: Queryable, auth: AuthContext, orderId: string)
       createdAt: iso(payment.createdAt),
       reversedAt: iso(payment.reversedAt),
       reversalReason: payment.reversalReason,
+    })),
+    corrections: corrections.map((correction) => ({
+      id: correction.id,
+      reason: correction.reason,
+      changedFields: Array.isArray(correction.changedFields) ? correction.changedFields : [],
+      correctedBy: correction.correctedBy,
+      correctedByName: correction.correctedByName,
+      fromVersion: Number(correction.fromVersion),
+      toVersion: Number(correction.toVersion),
+      createdAt: iso(correction.createdAt),
     })),
   };
 }
@@ -425,6 +681,33 @@ async function getPartnerView(database: Queryable, tenantId: string, partnerId: 
   return partner;
 }
 
+async function getOrderImportBatch(database: Queryable, tenantId: string, batchId: string) {
+  const [batchResult, ordersResult] = await Promise.all([
+    database.query(
+      `SELECT id, file_name, selected_rows, created_by, created_at
+       FROM order_import_batches WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, batchId],
+    ),
+    database.query(
+      `SELECT id, order_no FROM orders
+       WHERE tenant_id = $1 AND import_batch_id = $2
+       ORDER BY created_at, id`,
+      [tenantId, batchId],
+    ),
+  ]);
+  const batch = batchResult.rows[0];
+  if (!batch) throw new ApiError(404, "IMPORT_BATCH_NOT_FOUND", "导入批次不存在");
+  return {
+    id: batch.id,
+    fileName: batch.file_name,
+    selectedRows: Array.isArray(batch.selected_rows) ? batch.selected_rows.map(Number) : [],
+    createdBy: batch.created_by,
+    createdAt: iso(batch.created_at),
+    importedCount: ordersResult.rowCount,
+    orders: ordersResult.rows.map((row) => ({ id: row.id, orderNo: row.order_no })),
+  };
+}
+
 async function listReminders(database: Queryable, auth: AuthContext) {
   const result = await database.query(
     `SELECT r.id, r.order_id, r.due_at, r.status, r.snoozed_until,
@@ -483,9 +766,10 @@ export function buildApp(options: AppOptions): FastifyInstance {
     trustProxy: ["127.0.0.0/8", "::1/128"],
   });
   const database = options.database;
+  const cache = options.cache ?? new NoopCache();
   const sessionTtlHours = options.sessionTtlHours ?? 168;
   const loginRateLimitMax = options.loginRateLimitMax ?? 5;
-  const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+  const loginRateLimitIpMax = options.loginRateLimitIpMax ?? Math.max(20, loginRateLimitMax * 20);
 
   void app.register(cookie);
   void app.register(helmet, {
@@ -518,24 +802,29 @@ export function buildApp(options: AppOptions): FastifyInstance {
       ? (request.body as { phone?: unknown }).phone
       : undefined;
     const phone = typeof rawPhone === "string" ? normalizePhone(rawPhone).slice(0, 64) : "";
-    const key = `${request.ip}:${phone}`;
-    const now = Date.now();
-    const current = loginAttempts.get(key);
-    const attempt = !current || current.resetAt <= now
-      ? { count: 1, resetAt: now + 60_000 }
-      : { count: current.count + 1, resetAt: current.resetAt };
-    loginAttempts.set(key, attempt);
-    reply.header("X-RateLimit-Limit", loginRateLimitMax);
-    reply.header("X-RateLimit-Remaining", Math.max(0, loginRateLimitMax - attempt.count));
-    if (attempt.count > loginRateLimitMax) {
-      reply.header("Retry-After", Math.max(1, Math.ceil((attempt.resetAt - now) / 1000)));
-      throw new ApiError(429, "LOGIN_RATE_LIMITED", "登录尝试过于频繁，请稍后再试");
+    const rules: FixedWindowRule[] = [{
+      key: loginRateLimitKey("ip", request.ip),
+      limit: loginRateLimitIpMax,
+    }];
+    if (phone) {
+      rules.push(
+        { key: loginRateLimitKey("phone", phone), limit: loginRateLimitMax },
+        { key: loginRateLimitKey("ip-phone", `${request.ip}\0${phone}`), limit: loginRateLimitMax },
+      );
     }
-    if (loginAttempts.size > 10_000) {
-      for (const [storedKey, value] of loginAttempts) {
-        if (value.resetAt <= now) loginAttempts.delete(storedKey);
-      }
-      if (loginAttempts.size > 10_000) loginAttempts.delete(loginAttempts.keys().next().value as string);
+
+    let attempt: FixedWindowResult;
+    try {
+      attempt = await cache.consumeFixedWindow(rules, LOGIN_RATE_LIMIT_WINDOW_SECONDS);
+    } catch {
+      reply.header("Retry-After", "1");
+      throw new ApiError(503, "LOGIN_RATE_LIMIT_UNAVAILABLE", "登录保护服务暂不可用，请稍后再试");
+    }
+    reply.header("X-RateLimit-Limit", loginRateLimitMax);
+    reply.header("X-RateLimit-Remaining", attempt.remaining);
+    if (!attempt.allowed) {
+      reply.header("Retry-After", Math.max(1, attempt.retryAfterSeconds));
+      throw new ApiError(429, "LOGIN_RATE_LIMITED", "登录尝试过于频繁，请稍后再试");
     }
   };
 
@@ -633,6 +922,84 @@ export function buildApp(options: AppOptions): FastifyInstance {
     });
   });
 
+  app.post("/api/auth/accept-invitation", async (request, reply) => {
+    const input = parse(acceptMemberInvitationSchema, request.body);
+    const tokenHash = memberInvitationHash(input.token);
+    let acceptedMember: { tenantId: string; userId: string; phone: string; role: Role } | undefined;
+    await database.transaction(async (tx) => {
+      const reference = await tx.query<{ tenant_id: string }>(
+        "SELECT tenant_id FROM member_invitations WHERE token_hash = $1",
+        [tokenHash],
+      );
+      if (!reference.rows[0]) throw new ApiError(400, "INVALID_INVITATION", "邀请无效或已过期");
+      await lockTenantForMemberMutation(tx, reference.rows[0].tenant_id);
+      const result = await tx.query<{
+        invitation_id: string;
+        tenant_id: string;
+        user_id: string;
+        phone: string;
+        role: string;
+        membership_active: boolean;
+        expires_at: Date | string;
+        accepted_at: Date | string | null;
+        revoked_at: Date | string | null;
+      }>(
+        `SELECT invitation.id AS invitation_id, invitation.tenant_id, invitation.user_id,
+                u.phone, m.role, m.is_active AS membership_active,
+                invitation.expires_at, invitation.accepted_at, invitation.revoked_at
+         FROM member_invitations invitation
+         JOIN memberships m
+           ON m.tenant_id = invitation.tenant_id
+          AND m.user_id = invitation.user_id
+         JOIN users u ON u.id = invitation.user_id
+         WHERE invitation.tenant_id = $1 AND invitation.token_hash = $2
+         FOR UPDATE OF invitation, m, u`,
+        [reference.rows[0].tenant_id, tokenHash],
+      );
+      const invitation = result.rows[0];
+      if (!invitation
+          || invitation.accepted_at !== null
+          || invitation.revoked_at !== null
+          || invitation.membership_active
+          || new Date(invitation.expires_at).getTime() <= Date.now()) {
+        throw new ApiError(400, "INVALID_INVITATION", "邀请无效或已过期");
+      }
+      const passwordHash = await bcrypt.hash(input.password, 12);
+      await tx.query(
+        `UPDATE users SET password_hash = $2, is_active = true, updated_at = now()
+         WHERE id = $1`,
+        [invitation.user_id, passwordHash],
+      );
+      await tx.query(
+        `UPDATE memberships SET is_active = true
+         WHERE tenant_id = $1 AND user_id = $2`,
+        [invitation.tenant_id, invitation.user_id],
+      );
+      await tx.query(
+        `UPDATE member_invitations SET accepted_at = now()
+         WHERE id = $1 AND accepted_at IS NULL`,
+        [invitation.invitation_id],
+      );
+      const role = roleSchema.parse(invitation.role);
+      await writeAudit(tx, {
+        tenantId: invitation.tenant_id,
+        actorUserId: invitation.user_id,
+        action: "member.invitation_accepted",
+        entityType: "member",
+        entityId: invitation.user_id,
+        metadata: { role },
+      });
+      acceptedMember = {
+        tenantId: invitation.tenant_id,
+        userId: invitation.user_id,
+        phone: invitation.phone,
+        role,
+      };
+    });
+    if (!acceptedMember) throw new ApiError(500, "INVITATION_ACCEPTANCE_FAILED", "接受邀请失败");
+    return reply.send({ success: true, member: acceptedMember });
+  });
+
   app.post("/api/auth/logout", async (request, reply) => {
     const auth = await authenticate(database, request, publicOrigin);
     await database.transaction(async (tx) => {
@@ -705,9 +1072,238 @@ export function buildApp(options: AppOptions): FastifyInstance {
     return reply.send({ success: true, revokedSessions });
   });
 
+  app.get("/api/members", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner"]);
+    return { members: await listMembers(database, auth.tenantId) };
+  });
+
+  app.post("/api/members", async (request, reply) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner"]);
+    const input = parse(createMemberSchema, request.body);
+    const userId = newId();
+    const invitationId = newId();
+    const invitationToken = randomBytes(32).toString("base64url");
+    const invitationTokenHash = memberInvitationHash(invitationToken);
+    const placeholderPasswordHash = await bcrypt.hash(randomBytes(32).toString("base64url"), 12);
+    const expiresAt = new Date(Date.now() + MEMBER_INVITATION_TTL_MS);
+    await database.transaction(async (tx) => {
+      await lockTenantForMemberMutation(tx, auth.tenantId);
+      const existing = await tx.query("SELECT id FROM users WHERE phone = $1", [input.phone]);
+      if (existing.rowCount) {
+        throw new ApiError(409, "MEMBER_PHONE_IN_USE", "该手机号已绑定其他账号");
+      }
+      await tx.query(
+        `INSERT INTO users (id, phone, display_name, password_hash)
+         VALUES ($1, $2, $3, $4)`,
+        [userId, input.phone, input.displayName, placeholderPasswordHash],
+      );
+      await tx.query(
+        `INSERT INTO memberships (tenant_id, user_id, role, is_active)
+         VALUES ($1, $2, $3, false)`,
+        [auth.tenantId, userId, input.role],
+      );
+      await tx.query(
+        `INSERT INTO member_invitations
+           (id, tenant_id, user_id, token_hash, expires_at, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [invitationId, auth.tenantId, userId, invitationTokenHash, expiresAt.toISOString(), auth.userId],
+      );
+      await writeAudit(tx, {
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: "member.invited",
+        entityType: "member",
+        entityId: userId,
+        metadata: { phone: input.phone, displayName: input.displayName, role: input.role, expiresAt: expiresAt.toISOString() },
+      });
+    });
+    return reply.status(201).send({
+      member: await getMemberView(database, auth.tenantId, userId),
+      invitation: { token: invitationToken, expiresAt: expiresAt.toISOString() },
+    });
+  });
+
+  app.post("/api/members/:id/reinvite", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner"]);
+    const params = parse(z.object({ id: z.uuid() }).strict(), request.params);
+    const invitationToken = randomBytes(32).toString("base64url");
+    const invitationTokenHash = memberInvitationHash(invitationToken);
+    const expiresAt = new Date(Date.now() + MEMBER_INVITATION_TTL_MS);
+    await database.transaction(async (tx) => {
+      await lockTenantForMemberMutation(tx, auth.tenantId);
+      const memberResult = await tx.query<{ is_active: boolean }>(
+        `SELECT is_active FROM memberships
+         WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE`,
+        [auth.tenantId, params.id],
+      );
+      const member = memberResult.rows[0];
+      if (!member) throw new ApiError(404, "MEMBER_NOT_FOUND", "成员不存在");
+      const invitationResult = await tx.query<{ id: string; accepted_at: Date | string | null }>(
+        `SELECT id, accepted_at FROM member_invitations
+         WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE`,
+        [auth.tenantId, params.id],
+      );
+      const invitation = invitationResult.rows[0];
+      if (!invitation || invitation.accepted_at !== null || member.is_active) {
+        throw new ApiError(409, "MEMBER_ALREADY_ACTIVATED", "已激活成员不需要重新邀请");
+      }
+      await tx.query(
+        `UPDATE member_invitations
+         SET token_hash = $3, expires_at = $4, revoked_at = NULL,
+             created_by = $5, created_at = now()
+         WHERE tenant_id = $1 AND user_id = $2`,
+        [auth.tenantId, params.id, invitationTokenHash, expiresAt.toISOString(), auth.userId],
+      );
+      await writeAudit(tx, {
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: "member.reinvited",
+        entityType: "member",
+        entityId: params.id,
+        metadata: { expiresAt: expiresAt.toISOString() },
+      });
+    });
+    return {
+      member: await getMemberView(database, auth.tenantId, params.id),
+      invitation: { token: invitationToken, expiresAt: expiresAt.toISOString() },
+    };
+  });
+
+  app.patch("/api/members/:id/role", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner"]);
+    const params = parse(z.object({ id: z.uuid() }).strict(), request.params);
+    const input = parse(updateMemberRoleSchema, request.body);
+    let changed = false;
+    await database.transaction(async (tx) => {
+      await lockTenantForMemberMutation(tx, auth.tenantId);
+      const result = await tx.query<{ role: string; is_active: boolean }>(
+        `SELECT role, is_active FROM memberships
+         WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE`,
+        [auth.tenantId, params.id],
+      );
+      const member = result.rows[0];
+      if (!member) throw new ApiError(404, "MEMBER_NOT_FOUND", "成员不存在");
+      const previousRole = roleSchema.parse(member.role);
+      if (previousRole === input.role) return;
+      if (previousRole === "owner" && member.is_active && input.role !== "owner") {
+        await requireAnotherActiveOwner(tx, auth.tenantId);
+      }
+      await tx.query(
+        `UPDATE memberships SET role = $3
+         WHERE tenant_id = $1 AND user_id = $2`,
+        [auth.tenantId, params.id, input.role],
+      );
+      await writeAudit(tx, {
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: "member.role_changed",
+        entityType: "member",
+        entityId: params.id,
+        metadata: { previousRole, role: input.role },
+      });
+      changed = true;
+    });
+    return {
+      member: await getMemberView(database, auth.tenantId, params.id),
+      idempotentReplay: !changed,
+    };
+  });
+
+  app.patch("/api/members/:id/status", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner"]);
+    const params = parse(z.object({ id: z.uuid() }).strict(), request.params);
+    const input = parse(updateMemberStatusSchema, request.body);
+    let changed = false;
+    let revokedSessions = 0;
+    await database.transaction(async (tx) => {
+      await lockTenantForMemberMutation(tx, auth.tenantId);
+      const result = await tx.query<{
+        role: string;
+        is_active: boolean;
+        invitation_id: string | null;
+        invitation_accepted_at: Date | string | null;
+        invitation_revoked_at: Date | string | null;
+      }>(
+        `SELECT m.role, m.is_active, invitation.id AS invitation_id,
+                invitation.accepted_at AS invitation_accepted_at,
+                invitation.revoked_at AS invitation_revoked_at
+         FROM memberships m
+         LEFT JOIN member_invitations invitation
+           ON invitation.tenant_id = m.tenant_id
+          AND invitation.user_id = m.user_id
+         WHERE m.tenant_id = $1 AND m.user_id = $2
+         FOR UPDATE OF m`,
+        [auth.tenantId, params.id],
+      );
+      const member = result.rows[0];
+      if (!member) throw new ApiError(404, "MEMBER_NOT_FOUND", "成员不存在");
+      if (!input.active
+          && !member.is_active
+          && member.invitation_id
+          && member.invitation_accepted_at === null
+          && member.invitation_revoked_at === null) {
+        await tx.query(
+          `UPDATE member_invitations SET revoked_at = now()
+           WHERE tenant_id = $1 AND user_id = $2 AND accepted_at IS NULL AND revoked_at IS NULL`,
+          [auth.tenantId, params.id],
+        );
+        await writeAudit(tx, {
+          tenantId: auth.tenantId,
+          actorUserId: auth.userId,
+          action: "member.invitation_revoked",
+          entityType: "member",
+          entityId: params.id,
+        });
+        changed = true;
+        return;
+      }
+      if (member.is_active === input.active) return;
+      if (input.active && member.invitation_id && member.invitation_accepted_at === null) {
+        throw new ApiError(409, "MEMBER_INVITATION_PENDING", "成员接受邀请后才能启用");
+      }
+      const role = roleSchema.parse(member.role);
+      if (!input.active && role === "owner") {
+        await requireAnotherActiveOwner(tx, auth.tenantId);
+      }
+      await tx.query(
+        `UPDATE memberships SET is_active = $3
+         WHERE tenant_id = $1 AND user_id = $2`,
+        [auth.tenantId, params.id, input.active],
+      );
+      if (!input.active) {
+        const revoked = await tx.query(
+          `UPDATE sessions SET revoked_at = now()
+           WHERE tenant_id = $1 AND user_id = $2 AND revoked_at IS NULL
+           RETURNING id`,
+          [auth.tenantId, params.id],
+        );
+        revokedSessions = revoked.rowCount;
+      }
+      await writeAudit(tx, {
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: input.active ? "member.reactivated" : "member.deactivated",
+        entityType: "member",
+        entityId: params.id,
+        metadata: input.active ? {} : { revokedSessions },
+      });
+      changed = true;
+    });
+    return {
+      member: await getMemberView(database, auth.tenantId, params.id),
+      revokedSessions,
+      idempotentReplay: !changed,
+    };
+  });
+
   app.get("/api/bootstrap", async (request) => {
     const auth = await authenticate(database, request, publicOrigin);
-    const [ordersResult, partners, reminders] = await Promise.all([
+    const [ordersResult, partners, reminders, recentPaymentsResult] = await Promise.all([
       database.query(
         `${orderSelect}
          WHERE o.tenant_id = $1
@@ -717,6 +1313,26 @@ export function buildApp(options: AppOptions): FastifyInstance {
       ),
       listPartners(database, auth.tenantId),
       listReminders(database, auth),
+      database.query(
+        `SELECT pay.id, pay.order_id, pay.amount_cents::text, pay.method, pay.paid_at,
+                o.order_no, o.direction, o.currency, p.name AS partner_name,
+                reversal.reversed_at
+         FROM payments pay
+         JOIN orders o
+           ON o.tenant_id = pay.tenant_id
+          AND o.id = pay.order_id
+         JOIN partners p
+           ON p.tenant_id = o.tenant_id
+          AND p.id = o.partner_id
+         LEFT JOIN payment_reversals reversal
+           ON reversal.tenant_id = pay.tenant_id
+          AND reversal.payment_id = pay.id
+          AND reversal.order_id = pay.order_id
+         WHERE pay.tenant_id = $1
+         ORDER BY pay.paid_at DESC, pay.created_at DESC, pay.id DESC
+         LIMIT 6`,
+        [auth.tenantId],
+      ),
     ]);
     return {
       user: { id: auth.userId, phone: auth.phone, displayName: auth.displayName },
@@ -725,6 +1341,18 @@ export function buildApp(options: AppOptions): FastifyInstance {
       orders: ordersResult.rows.map(mapOrder),
       partners,
       reminders,
+      recentPayments: recentPaymentsResult.rows.map((row) => ({
+        id: row.id,
+        orderId: row.order_id,
+        orderNo: row.order_no,
+        partnerName: row.partner_name,
+        direction: row.direction,
+        currency: row.currency,
+        amountCents: money(row.amount_cents),
+        method: row.method,
+        paidAt: iso(row.paid_at),
+        reversedAt: iso(row.reversed_at),
+      })),
     };
   });
 
@@ -841,6 +1469,229 @@ export function buildApp(options: AppOptions): FastifyInstance {
   app.patch("/api/partners/:id", async (request) => ({ partner: await updatePartner(request) }));
   app.patch("/api/contacts/:id", async (request) => ({ contact: await updatePartner(request) }));
 
+  app.post("/api/order-imports/preview", { bodyLimit: 14_500_000 }, async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "sales"]);
+    const input = parse(orderImportFileSchema, request.body);
+    const buffer = decodeOrderImportContent(input.contentBase64);
+    const existingResult = await database.query<{ order_no: string }>(
+      "SELECT order_no FROM orders WHERE tenant_id = $1",
+      [auth.tenantId],
+    );
+    const preview = await inspectOrderImport(
+      buffer,
+      input.fileName,
+      input.mapping,
+      existingResult.rows.map((row) => row.order_no),
+      input.mapping === undefined,
+    );
+    return { preview };
+  });
+
+  app.post("/api/order-imports/commit", { bodyLimit: 14_500_000 }, async (request, reply) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "sales"]);
+    const input = parse(commitOrderImportSchema, request.body);
+    const idempotencyKey = requestIdempotencyKey(request);
+    const buffer = decodeOrderImportContent(input.contentBase64);
+    const requestHash = orderImportRequestHash(buffer, input.fileName, input.mapping, input.rowNumbers);
+    if (input.rowNumbers && new Set(input.rowNumbers).size !== input.rowNumbers.length) {
+      throw new ApiError(400, "DUPLICATE_ROW_SELECTION", "导入行号不能重复");
+    }
+
+    const existingBatch = await database.query<{ id: string; request_hash: string }>(
+      `SELECT id, request_hash FROM order_import_batches
+       WHERE tenant_id = $1 AND idempotency_key = $2`,
+      [auth.tenantId, idempotencyKey],
+    );
+    if (existingBatch.rows[0]) {
+      if (existingBatch.rows[0].request_hash !== requestHash) {
+        throw new ApiError(409, "IDEMPOTENCY_KEY_REUSED", "同一 Idempotency-Key 不能用于不同导入内容");
+      }
+      return reply.send({
+        batch: await getOrderImportBatch(database, auth.tenantId, existingBatch.rows[0].id),
+        idempotentReplay: true,
+      });
+    }
+
+    const existingOrders = await database.query<{ order_no: string }>(
+      "SELECT order_no FROM orders WHERE tenant_id = $1",
+      [auth.tenantId],
+    );
+    const preview = await inspectOrderImport(
+      buffer,
+      input.fileName,
+      input.mapping,
+      existingOrders.rows.map((row) => row.order_no),
+    );
+    const requestedRows = input.rowNumbers ? new Set(input.rowNumbers) : null;
+    if (requestedRows) {
+      const availableRows = new Set(preview.rows.map((row) => row.rowNumber));
+      const missingRows = [...requestedRows].filter((rowNumber) => !availableRows.has(rowNumber));
+      if (missingRows.length) {
+        throw new ApiError(400, "IMPORT_ROWS_NOT_FOUND", "选择的导入行不存在", { rowNumbers: missingRows });
+      }
+    }
+    const selectedRows = preview.rows.filter((row) => requestedRows ? requestedRows.has(row.rowNumber) : row.valid);
+    const invalidSelectedRows = selectedRows.filter((row) => !row.valid);
+    if (invalidSelectedRows.length) {
+      throw new ApiError(400, "INVALID_IMPORT_ROWS", "选中的行仍有校验错误", {
+        rows: invalidSelectedRows.map((row) => ({ rowNumber: row.rowNumber, errors: row.errors })),
+      });
+    }
+    if (!selectedRows.length) throw new ApiError(400, "NO_VALID_IMPORT_ROWS", "没有可以导入的有效行");
+
+    const partnerKinds = new Map<string, "customer" | "supplier" | "both">();
+    for (const row of selectedRows) {
+      const name = row.values.partnerName;
+      const direction = row.values.direction;
+      if (!name || !direction) throw new ApiError(500, "INVALID_IMPORT_STATE", "已校验导入行缺少关键字段");
+      const requiredKind = direction === "receivable" ? "customer" : "supplier";
+      const currentKind = partnerKinds.get(name);
+      partnerKinds.set(name, !currentKind || currentKind === requiredKind ? requiredKind : "both");
+    }
+
+    let batchId = "";
+    let replayed = false;
+    await database.transaction(async (tx) => {
+      await tx.query("SELECT id FROM tenants WHERE id = $1 FOR UPDATE", [auth.tenantId]);
+      const concurrentBatch = await tx.query<{ id: string; request_hash: string }>(
+        `SELECT id, request_hash FROM order_import_batches
+         WHERE tenant_id = $1 AND idempotency_key = $2`,
+        [auth.tenantId, idempotencyKey],
+      );
+      if (concurrentBatch.rows[0]) {
+        if (concurrentBatch.rows[0].request_hash !== requestHash) {
+          throw new ApiError(409, "IDEMPOTENCY_KEY_REUSED", "同一 Idempotency-Key 不能用于不同导入内容");
+        }
+        batchId = concurrentBatch.rows[0].id;
+        replayed = true;
+        return;
+      }
+
+      const orderNumbers = selectedRows.map((row) => row.values.orderNo as string);
+      const duplicateOrders = await tx.query<{ order_no: string }>(
+        "SELECT order_no FROM orders WHERE tenant_id = $1 AND order_no = ANY($2::text[])",
+        [auth.tenantId, orderNumbers],
+      );
+      if (duplicateOrders.rowCount) {
+        throw new ApiError(409, "IMPORT_ORDER_ALREADY_EXISTS", "部分订单号已存在，请重新预览", {
+          orderNumbers: duplicateOrders.rows.map((row) => row.order_no),
+        });
+      }
+
+      batchId = newId();
+      const selectedRowNumbers = selectedRows.map((row) => row.rowNumber);
+      await tx.query(
+        `INSERT INTO order_import_batches
+           (id, tenant_id, file_name, idempotency_key, request_hash, selected_rows, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [batchId, auth.tenantId, input.fileName, idempotencyKey, requestHash, selectedRowNumbers, auth.userId],
+      );
+
+      const partnerNames = [...partnerKinds.keys()];
+      const existingPartners = await tx.query<{ id: string; name: string; kind: "customer" | "supplier" | "both" }>(
+        "SELECT id, name, kind FROM partners WHERE tenant_id = $1 AND name = ANY($2::text[])",
+        [auth.tenantId, partnerNames],
+      );
+      const partnersByName = new Map(existingPartners.rows.map((partner) => [partner.name, partner]));
+      for (const [name, requiredKind] of partnerKinds) {
+        const existing = partnersByName.get(name);
+        if (!existing) {
+          const partnerId = newId();
+          await tx.query(
+            `INSERT INTO partners (id, tenant_id, name, kind)
+             VALUES ($1, $2, $3, $4)`,
+            [partnerId, auth.tenantId, name, requiredKind],
+          );
+          partnersByName.set(name, { id: partnerId, name, kind: requiredKind });
+          await writeAudit(tx, {
+            tenantId: auth.tenantId,
+            actorUserId: auth.userId,
+            action: "partner.created",
+            entityType: "partner",
+            entityId: partnerId,
+            metadata: { name, kind: requiredKind, importBatchId: batchId },
+          });
+        } else if (existing.kind !== "both" && existing.kind !== requiredKind) {
+          await tx.query(
+            `UPDATE partners SET kind = 'both', version = version + 1, updated_at = now()
+             WHERE tenant_id = $1 AND id = $2`,
+            [auth.tenantId, existing.id],
+          );
+          existing.kind = "both";
+          await writeAudit(tx, {
+            tenantId: auth.tenantId,
+            actorUserId: auth.userId,
+            action: "partner.updated",
+            entityType: "partner",
+            entityId: existing.id,
+            metadata: { changes: { kind: "both" }, importBatchId: batchId },
+          });
+        }
+      }
+
+      for (const row of selectedRows) {
+        const values = row.values;
+        const partner = values.partnerName ? partnersByName.get(values.partnerName) : undefined;
+        if (!partner || !values.orderNo || !values.direction || !values.orderDate
+            || !values.itemDescription || values.quantity === null
+            || values.unitPriceCents === null || values.lineTotalCents === null) {
+          throw new ApiError(500, "INVALID_IMPORT_STATE", "已校验导入行缺少关键字段");
+        }
+        const orderId = newId();
+        await tx.query(
+          `INSERT INTO orders (
+             id, tenant_id, partner_id, order_no, direction, order_date, planned_delivery_date,
+             fulfillment_status, settlement_days, settlement_months, currency, total_cents,
+             notes, created_by, import_batch_id
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'planned', 0, $8, $9, $10, $11, $12, $13)`,
+          [
+            orderId, auth.tenantId, partner.id, values.orderNo, values.direction, values.orderDate,
+            values.plannedDeliveryDate, values.settlementMonths, values.currency, values.lineTotalCents,
+            `由 ${input.fileName} 第 ${row.rowNumber} 行导入`, auth.userId, batchId,
+          ],
+        );
+        await tx.query(
+          `INSERT INTO order_items
+             (id, tenant_id, order_id, description, quantity, unit_price_cents, line_total_cents)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            newId(), auth.tenantId, orderId, values.itemDescription, values.quantity,
+            values.unitPriceCents, values.lineTotalCents,
+          ],
+        );
+        await writeAudit(tx, {
+          tenantId: auth.tenantId,
+          actorUserId: auth.userId,
+          action: "order.imported",
+          entityType: "order",
+          entityId: orderId,
+          metadata: { importBatchId: batchId, sourceRow: row.rowNumber, orderNo: values.orderNo },
+        });
+      }
+
+      await writeAudit(tx, {
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: "import.completed",
+        entityType: "order_import",
+        entityId: batchId,
+        metadata: {
+          fileName: input.fileName,
+          importedCount: selectedRows.length,
+          skippedInvalidCount: preview.invalidRowCount,
+        },
+      });
+    });
+
+    return reply.status(replayed ? 200 : 201).send({
+      batch: await getOrderImportBatch(database, auth.tenantId, batchId),
+      idempotentReplay: replayed,
+      skippedInvalidCount: preview.invalidRowCount,
+    });
+  });
+
   app.get("/api/orders", async (request) => {
     const auth = await authenticate(database, request, publicOrigin);
     const query = parse(z.object({
@@ -863,15 +1714,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
     const auth = await authenticate(database, request, publicOrigin);
     requireRole(auth, ["owner", "finance", "sales"]);
     const input = parse(createOrderSchema, request.body);
-    const calculatedItems = input.items.map((item) => {
-      const lineTotalCents = item.quantity * item.unitPriceCents;
-      if (!Number.isSafeInteger(lineTotalCents)) throw new ApiError(400, "AMOUNT_TOO_LARGE", "商品金额超出安全范围");
-      return { ...item, lineTotalCents };
-    });
-    const totalCents = calculatedItems.reduce((sum, item) => sum + item.lineTotalCents, 0);
-    if (!Number.isSafeInteger(totalCents) || totalCents <= 0) {
-      throw new ApiError(400, "INVALID_TOTAL", "订单总额必须大于 0 且不能超出安全范围");
-    }
+    const { calculatedItems, totalCents } = calculateOrderItems(input.items);
     const orderId = newId();
     await database.transaction(async (tx) => {
       const partnerResult = await tx.query<{ kind: string }>(
@@ -924,6 +1767,313 @@ export function buildApp(options: AppOptions): FastifyInstance {
     return { order: await getOrder(database, auth, params.id) };
   });
 
+  app.patch("/api/orders/:id", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "sales"]);
+    const params = parse(z.object({ id: z.uuid() }).strict(), request.params);
+    const input = parse(updateOrderSchema, request.body);
+    const { calculatedItems, totalCents } = calculateOrderItems(input.items);
+    let changed = false;
+
+    await database.transaction(async (tx) => {
+      const currentResult = await tx.query<{
+        version: number;
+        partner_id: string;
+        order_no: string;
+        direction: "receivable" | "payable";
+        order_date: string;
+        planned_delivery_date: string | null;
+        fulfillment_status: "planned" | "fulfilled" | "cancelled";
+        fulfilled_at: Date | string | null;
+        settlement_days: number;
+        settlement_months: number;
+        due_at: Date | string | null;
+        currency: string;
+        total_cents: string;
+        notes: string | null;
+        paid_cents: string;
+        has_payment_history: boolean;
+        items: unknown;
+      }>(
+        `SELECT o.version, o.partner_id, o.order_no, o.direction, o.order_date::text,
+                o.planned_delivery_date::text, o.fulfillment_status, o.fulfilled_at,
+                o.settlement_days, o.settlement_months, o.due_at, o.currency,
+                o.total_cents::text, o.notes,
+                COALESCE((
+                  SELECT SUM(pay.amount_cents)
+                  FROM payments pay
+                  WHERE pay.tenant_id = o.tenant_id
+                    AND pay.order_id = o.id
+                    AND NOT EXISTS (
+                      SELECT 1 FROM payment_reversals reversal
+                      WHERE reversal.tenant_id = pay.tenant_id
+                        AND reversal.payment_id = pay.id
+                        AND reversal.order_id = pay.order_id
+                    )
+                ), 0)::text AS paid_cents,
+                EXISTS(
+                  SELECT 1 FROM payments pay
+                  WHERE pay.tenant_id = o.tenant_id AND pay.order_id = o.id
+                ) AS has_payment_history,
+                COALESCE((
+                  SELECT jsonb_agg(
+                    jsonb_build_object(
+                      'description', item.description,
+                      'quantity', item.quantity,
+                      'unitPriceCents', item.unit_price_cents::text,
+                      'lineTotalCents', item.line_total_cents::text
+                    ) ORDER BY item.created_at, item.id
+                  )
+                  FROM order_items item
+                  WHERE item.tenant_id = o.tenant_id AND item.order_id = o.id
+                ), '[]'::jsonb) AS items
+         FROM orders o
+         WHERE o.tenant_id = $1 AND o.id = $2
+         FOR UPDATE`,
+        [auth.tenantId, params.id],
+      );
+      const current = currentResult.rows[0];
+      if (!current) throw new ApiError(404, "NOT_FOUND", "订单不存在");
+      if (current.fulfillment_status === "cancelled") {
+        throw new ApiError(409, "ORDER_CANCELLED", "已取消订单不能更正");
+      }
+      if (current.fulfillment_status === "fulfilled" && auth.role === "sales") {
+        throw new ApiError(403, "FULFILLED_ORDER_CORRECTION_FORBIDDEN", "已交货订单只能由负责人或财务更正");
+      }
+      if (Number(current.version) !== input.version) {
+        throw new ApiError(409, "ORDER_VERSION_CONFLICT", "订单已被其他人修改，请刷新后重试", {
+          currentVersion: Number(current.version),
+        });
+      }
+
+      const partnerResult = await tx.query<{ kind: string }>(
+        "SELECT kind FROM partners WHERE tenant_id = $1 AND id = $2",
+        [auth.tenantId, input.partnerId],
+      );
+      const partner = partnerResult.rows[0];
+      if (!partner) throw new ApiError(404, "PARTNER_NOT_FOUND", "往来单位不存在");
+      const validKind = partner.kind === "both"
+        || (input.direction === "receivable" && partner.kind === "customer")
+        || (input.direction === "payable" && partner.kind === "supplier");
+      if (!validKind) throw new ApiError(400, "PARTNER_KIND_MISMATCH", "往来单位类型与收付方向不匹配");
+
+      if (input.orderNo !== current.order_no) {
+        const duplicate = await tx.query(
+          "SELECT id FROM orders WHERE tenant_id = $1 AND order_no = $2 AND id <> $3",
+          [auth.tenantId, input.orderNo, params.id],
+        );
+        if (duplicate.rowCount) throw new ApiError(409, "DUPLICATE_ORDER_NO", "订单号已存在");
+      }
+
+      if (current.has_payment_history
+          && (input.currency !== current.currency
+            || input.direction !== current.direction
+            || input.partnerId !== current.partner_id)) {
+        throw new ApiError(
+          409,
+          "SETTLED_IDENTITY_LOCKED",
+          "已有收付款历史，不能修改往来单位、收付方向或币种",
+        );
+      }
+      const paidCents = money(current.paid_cents);
+      if (totalCents < paidCents) {
+        throw new ApiError(409, "TOTAL_BELOW_PAID", "更正后的订单金额不能低于已结金额");
+      }
+
+      let fulfilledAt = iso(current.fulfilled_at);
+      let dueAt = iso(current.due_at);
+      if (current.fulfillment_status === "planned") {
+        if (input.fulfilledAt) {
+          throw new ApiError(400, "PLANNED_ORDER_HAS_FULFILLMENT", "待交货订单不能填写实际交货时间");
+        }
+        fulfilledAt = null;
+        dueAt = null;
+      } else {
+        fulfilledAt = input.fulfilledAt ?? fulfilledAt;
+        if (!fulfilledAt) throw new ApiError(500, "MISSING_FULFILLMENT_TIME", "已交货订单缺少实际交货时间");
+        const fulfilledDate = new Date(fulfilledAt);
+        if (fulfilledDate.getTime() > Date.now() + FULFILLMENT_CLOCK_SKEW_MS) {
+          throw new ApiError(400, "FULFILLMENT_IN_FUTURE", "实际交货时间不能晚于当前时间 5 分钟以上");
+        }
+        const dueResult = await tx.query<{ due_at: Date | string; before_order_date: boolean }>(
+          `SELECT ((($1::timestamptz AT TIME ZONE $2)
+                    + make_interval(months => $3, days => $4))
+                   AT TIME ZONE $2) AS due_at,
+                  (($1::timestamptz AT TIME ZONE $2)::date < $5::date) AS before_order_date`,
+          [fulfilledDate.toISOString(), auth.tenantTimezone, input.settlementMonths, input.settlementDays, input.orderDate],
+        );
+        if (dueResult.rows[0]?.before_order_date) {
+          throw new ApiError(400, "FULFILLMENT_BEFORE_ORDER_DATE", "实际交货日期不能早于订货日期");
+        }
+        const calculatedDueAt = new Date(String(dueResult.rows[0]?.due_at));
+        if (Number.isNaN(calculatedDueAt.getTime())) {
+          throw new ApiError(500, "DUE_DATE_CALCULATION_FAILED", "账期计算失败");
+        }
+        fulfilledAt = fulfilledDate.toISOString();
+        dueAt = calculatedDueAt.toISOString();
+      }
+
+      const currentItems = Array.isArray(current.items)
+        ? (current.items as Record<string, unknown>[]).map((item) => ({
+          description: String(item.description),
+          quantity: Number(item.quantity),
+          unitPriceCents: money(item.unitPriceCents),
+          lineTotalCents: money(item.lineTotalCents),
+        }))
+        : [];
+      const beforeSnapshot = {
+        version: Number(current.version),
+        partnerId: current.partner_id,
+        orderNo: current.order_no,
+        direction: current.direction,
+        orderDate: dateOnly(current.order_date),
+        plannedDeliveryDate: dateOnly(current.planned_delivery_date),
+        fulfillmentStatus: current.fulfillment_status,
+        fulfilledAt: iso(current.fulfilled_at),
+        settlementDays: Number(current.settlement_days),
+        settlementMonths: Number(current.settlement_months),
+        dueAt: iso(current.due_at),
+        currency: current.currency,
+        totalCents: money(current.total_cents),
+        notes: current.notes,
+        items: currentItems,
+      };
+      const afterSnapshot = {
+        version: input.version + 1,
+        partnerId: input.partnerId,
+        orderNo: input.orderNo,
+        direction: input.direction,
+        orderDate: input.orderDate,
+        plannedDeliveryDate: input.plannedDeliveryDate ?? null,
+        fulfillmentStatus: current.fulfillment_status,
+        fulfilledAt,
+        settlementDays: input.settlementDays,
+        settlementMonths: input.settlementMonths,
+        dueAt,
+        currency: input.currency,
+        totalCents,
+        notes: input.notes ?? null,
+        items: calculatedItems,
+      };
+      const changedFields = [
+        "partnerId", "orderNo", "direction", "orderDate", "plannedDeliveryDate",
+        "fulfilledAt", "settlementDays", "settlementMonths", "dueAt", "currency",
+        "totalCents", "notes", "items",
+      ].filter((field) => JSON.stringify(beforeSnapshot[field as keyof typeof beforeSnapshot])
+        !== JSON.stringify(afterSnapshot[field as keyof typeof afterSnapshot]));
+      if (!changedFields.length) return;
+
+      const updated = await tx.query(
+        `UPDATE orders
+         SET partner_id = $3, order_no = $4, direction = $5, order_date = $6,
+             planned_delivery_date = $7, fulfilled_at = $8, settlement_days = $9,
+             settlement_months = $10, due_at = $11, currency = $12, total_cents = $13,
+             notes = $14, version = version + 1, updated_at = now()
+         WHERE tenant_id = $1 AND id = $2 AND version = $15
+         RETURNING id`,
+        [
+          auth.tenantId, params.id, input.partnerId, input.orderNo, input.direction,
+          input.orderDate, input.plannedDeliveryDate ?? null, fulfilledAt, input.settlementDays,
+          input.settlementMonths, dueAt, input.currency, totalCents, input.notes ?? null, input.version,
+        ],
+      );
+      if (!updated.rowCount) {
+        throw new ApiError(409, "ORDER_VERSION_CONFLICT", "订单已被其他人修改，请刷新后重试");
+      }
+      if (changedFields.includes("items")) {
+        await tx.query("DELETE FROM order_items WHERE tenant_id = $1 AND order_id = $2", [auth.tenantId, params.id]);
+        for (const item of calculatedItems) {
+          await tx.query(
+            `INSERT INTO order_items
+               (id, tenant_id, order_id, description, quantity, unit_price_cents, line_total_cents)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [newId(), auth.tenantId, params.id, item.description, item.quantity, item.unitPriceCents, item.lineTotalCents],
+          );
+        }
+      }
+
+      const correctionId = newId();
+      await tx.query(
+        `INSERT INTO order_corrections
+           (id, tenant_id, order_id, reason, changed_fields, before_snapshot, after_snapshot, corrected_by)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8)`,
+        [
+          correctionId, auth.tenantId, params.id, input.reason, changedFields,
+          JSON.stringify(beforeSnapshot), JSON.stringify(afterSnapshot), auth.userId,
+        ],
+      );
+
+      if (current.fulfillment_status === "fulfilled" && dueAt) {
+        const activeReminders = await tx.query<{ id: string }>(
+          `SELECT id FROM reminders
+           WHERE tenant_id = $1 AND order_id = $2 AND status IN ('open', 'acked', 'snoozed')
+           FOR UPDATE`,
+          [auth.tenantId, params.id],
+        );
+        if (totalCents === paidCents) {
+          await tx.query(
+            `UPDATE reminders
+             SET status = 'closed', closed_at = now(), updated_at = now()
+             WHERE tenant_id = $1 AND order_id = $2 AND status IN ('open', 'acked', 'snoozed')`,
+            [auth.tenantId, params.id],
+          );
+          for (const reminder of activeReminders.rows) {
+            await writeAudit(tx, {
+              tenantId: auth.tenantId,
+              actorUserId: auth.userId,
+              action: "reminder.closed",
+              entityType: "reminder",
+              entityId: reminder.id,
+              metadata: { orderId: params.id, correctionId },
+            });
+          }
+        } else if (activeReminders.rowCount) {
+          await tx.query(
+            `UPDATE reminders SET due_at = $3, updated_at = now()
+             WHERE tenant_id = $1 AND order_id = $2 AND status IN ('open', 'acked', 'snoozed')`,
+            [auth.tenantId, params.id, dueAt],
+          );
+        } else {
+          const reminderId = newId();
+          await tx.query(
+            `INSERT INTO reminders (id, tenant_id, order_id, due_at, status)
+             VALUES ($1, $2, $3, $4, 'open')`,
+            [reminderId, auth.tenantId, params.id, dueAt],
+          );
+          await writeAudit(tx, {
+            tenantId: auth.tenantId,
+            actorUserId: auth.userId,
+            action: "reminder.created",
+            entityType: "reminder",
+            entityId: reminderId,
+            metadata: { orderId: params.id, correctionId, dueAt },
+          });
+        }
+      }
+
+      await writeAudit(tx, {
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: "order.corrected",
+        entityType: "order",
+        entityId: params.id,
+        metadata: {
+          correctionId,
+          reason: input.reason,
+          changedFields,
+          fromVersion: input.version,
+          toVersion: input.version + 1,
+        },
+      });
+      changed = true;
+    });
+
+    return {
+      order: await getOrder(database, auth, params.id),
+      idempotentReplay: !changed,
+    };
+  });
+
   app.post("/api/orders/:id/cancel", async (request) => {
     const auth = await authenticate(database, request, publicOrigin);
     requireRole(auth, ["owner", "finance", "sales"]);
@@ -955,7 +2105,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
       }
       await tx.query(
         `UPDATE orders
-         SET fulfillment_status = 'cancelled', updated_at = now()
+         SET fulfillment_status = 'cancelled', version = version + 1, updated_at = now()
          WHERE tenant_id = $1 AND id = $2`,
         [auth.tenantId, params.id],
       );
@@ -979,8 +2129,8 @@ export function buildApp(options: AppOptions): FastifyInstance {
     const params = parse(z.object({ id: z.uuid() }), request.params);
     const input = parse(fulfillSchema, request.body ?? {});
     await database.transaction(async (tx) => {
-      const result = await tx.query<{ fulfillment_status: string; settlement_days: number; settlement_months: number }>(
-        `SELECT fulfillment_status, settlement_days, settlement_months FROM orders
+      const result = await tx.query<{ fulfillment_status: string; order_date: string; settlement_days: number; settlement_months: number }>(
+        `SELECT fulfillment_status, order_date::text, settlement_days, settlement_months FROM orders
          WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
         [auth.tenantId, params.id],
       );
@@ -989,16 +2139,24 @@ export function buildApp(options: AppOptions): FastifyInstance {
       if (order.fulfillment_status === "cancelled") throw new ApiError(409, "ORDER_CANCELLED", "已取消订单不能确认交货");
       if (order.fulfillment_status === "fulfilled") return;
       const fulfilledAt = input.fulfilledAt ? new Date(input.fulfilledAt) : new Date();
-      const dueResult = await tx.query<{ due_at: Date | string }>(
+      if (fulfilledAt.getTime() > Date.now() + FULFILLMENT_CLOCK_SKEW_MS) {
+        throw new ApiError(400, "FULFILLMENT_IN_FUTURE", "实际交货时间不能晚于当前时间 5 分钟以上");
+      }
+      const dueResult = await tx.query<{ due_at: Date | string; before_order_date: boolean }>(
         `SELECT ((($1::timestamptz AT TIME ZONE $2)
                   + make_interval(months => $3, days => $4))
-                 AT TIME ZONE $2) AS due_at`,
-        [fulfilledAt.toISOString(), auth.tenantTimezone, Number(order.settlement_months), Number(order.settlement_days)],
+                 AT TIME ZONE $2) AS due_at,
+                (($1::timestamptz AT TIME ZONE $2)::date < $5::date) AS before_order_date`,
+        [fulfilledAt.toISOString(), auth.tenantTimezone, Number(order.settlement_months), Number(order.settlement_days), order.order_date],
       );
+      if (dueResult.rows[0]?.before_order_date) {
+        throw new ApiError(400, "FULFILLMENT_BEFORE_ORDER_DATE", "实际交货日期不能早于订货日期");
+      }
       const dueAt = new Date(String(dueResult.rows[0]?.due_at));
       if (Number.isNaN(dueAt.getTime())) throw new ApiError(500, "DUE_DATE_CALCULATION_FAILED", "账期计算失败");
       await tx.query(
-        `UPDATE orders SET fulfillment_status = 'fulfilled', fulfilled_at = $3, due_at = $4, updated_at = now()
+        `UPDATE orders SET fulfillment_status = 'fulfilled', fulfilled_at = $3, due_at = $4,
+             version = version + 1, updated_at = now()
          WHERE tenant_id = $1 AND id = $2`,
         [auth.tenantId, params.id, fulfilledAt.toISOString(), dueAt.toISOString()],
       );

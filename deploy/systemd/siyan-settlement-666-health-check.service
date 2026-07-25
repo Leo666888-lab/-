@@ -1,0 +1,45 @@
+[Unit]
+Description=Application and TLS health check for Siyan Settlement 666
+Wants=network-online.target
+After=network-online.target nginx.service siyan-settlement-666.service
+OnFailure=siyan-settlement-666-alert@%n.service
+
+[Service]
+Type=oneshot
+User=siyan-settlement-666-monitor
+Group=siyan-settlement-666-monitor
+SupplementaryGroups=siyan-settlement-666-release
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/usr/bin/bash /opt/siyan-settlement-666/current/deploy/scripts/siyan-settlement-666-health-check.sh --all
+TimeoutStartSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=true
+ReadOnlyPaths=/opt/siyan-settlement-666/current /opt/siyan-settlement-666/runtime
+InaccessiblePaths=/etc/siyan-settlement-666/app /etc/siyan-settlement-666/backup /etc/siyan-settlement-666/monitor /var/backups/siyan-settlement-666 /var/lib/siyan-settlement-666
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=siyan-settlement-666-health-check

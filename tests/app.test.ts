@@ -4,7 +4,8 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
-import { createPgliteDatabase, type Database, type Queryable } from "../src/db/index.js";
+import { NoopCache, type FixedWindowResult, type FixedWindowRule } from "../src/cache/index.js";
+import { createPgliteDatabase, createPostgresDatabase, type Database, type Queryable } from "../src/db/index.js";
 import { migrate } from "../src/db/migrate.js";
 import { DEMO_IDS, seedDemo } from "../src/seed.js";
 
@@ -19,6 +20,24 @@ const PUBLIC_ORIGIN = "http://localhost";
 interface QueryTrace {
   scope: "outside" | "transaction";
   sql: string;
+}
+
+class CapturingCache extends NoopCache {
+  readonly rules: FixedWindowRule[][] = [];
+
+  override async consumeFixedWindow(
+    rules: readonly FixedWindowRule[],
+    windowSeconds: number,
+  ): Promise<FixedWindowResult> {
+    this.rules.push(rules.map((rule) => ({ ...rule })));
+    return super.consumeFixedWindow(rules, windowSeconds);
+  }
+}
+
+class UnavailableRateLimitCache extends NoopCache {
+  override async consumeFixedWindow(): Promise<FixedWindowResult> {
+    throw new Error("cache unavailable");
+  }
 }
 
 function withQueryTrace(database: Database, trace: QueryTrace[]): Database {
@@ -122,8 +141,23 @@ describe.sequential("commercial settlement API", () => {
   };
 
   beforeAll(async () => {
-    database = await createPgliteDatabase(":memory:");
+    const postgresTestUrl = process.env.TEST_DATABASE_URL;
+    if (postgresTestUrl) {
+      const databaseName = decodeURIComponent(new URL(postgresTestUrl).pathname.slice(1));
+      if (!/(?:_ci|_test)$/.test(databaseName)) {
+        throw new Error("TEST_DATABASE_URL must target a database ending in _ci or _test");
+      }
+      database = await createPostgresDatabase(postgresTestUrl);
+    } else {
+      database = await createPgliteDatabase(":memory:");
+    }
     await migrate(database);
+    if (postgresTestUrl) {
+      const existing = await database.query<{ count: string }>("SELECT COUNT(*)::text AS count FROM tenants");
+      if (Number(existing.rows[0]?.count) !== 0) {
+        throw new Error("TEST_DATABASE_URL must target an empty database");
+      }
+    }
     await seedDemo(database);
 
     const passwordHash = await bcrypt.hash("demo1234", 4);
@@ -245,6 +279,24 @@ describe.sequential("commercial settlement API", () => {
     expect(response.statusCode).toBe(401);
     expect(response.json().error.code).toBe("INVALID_CREDENTIALS");
     expect(response.headers["cache-control"]).toBe("no-store");
+  });
+
+  it("returns tenant-scoped recent payment activity for the overview", async () => {
+    const response = await app.inject({ method: "GET", url: "/api/bootstrap", headers: auth(ownerToken) });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().tenant.name).toBe("义乌市糖安贸易有限公司");
+    const recentPayment = response.json().recentPayments.find((item: { id: string }) => item.id === DEMO_IDS.payment);
+    expect(recentPayment).toMatchObject({
+      id: DEMO_IDS.payment,
+      orderId: DEMO_IDS.receivableOrder,
+      direction: "receivable",
+      currency: "CNY",
+      amountCents: 300_000,
+      method: "bank_transfer",
+      reversedAt: null,
+    });
+    expect(recentPayment.partnerName).toBeTruthy();
+    expect(recentPayment.orderNo).toBeTruthy();
   });
 
   it("returns 404 instead of leaking another tenant's order", async () => {
@@ -378,6 +430,39 @@ describe.sequential("commercial settlement API", () => {
     });
     expect(payment.statusCode).toBe(409);
     expect(payment.json().error.code).toBe("ORDER_NOT_FULFILLED");
+  });
+
+  it("rejects fulfillment before the order date or beyond the clock-skew window", async () => {
+    const beforeOrderDate = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      headers: auth(ownerToken),
+      payload: {
+        partnerId: DEMO_IDS.customer,
+        orderNo: "FULFILLMENT-DATE-BOUNDARY-001",
+        direction: "receivable",
+        orderDate: "2020-01-02",
+        items: [{ description: "Delivery date validation", quantity: 1, unitPriceCents: 100 }],
+      },
+    });
+    expect(beforeOrderDate.statusCode).toBe(201);
+    const rejectedPast = await app.inject({
+      method: "POST",
+      url: `/api/orders/${beforeOrderDate.json().order.id}/fulfill`,
+      headers: auth(ownerToken),
+      payload: { fulfilledAt: "2020-01-01T12:00:00+08:00" },
+    });
+    expect(rejectedPast.statusCode).toBe(400);
+    expect(rejectedPast.json().error.code).toBe("FULFILLMENT_BEFORE_ORDER_DATE");
+
+    const rejectedFuture = await app.inject({
+      method: "POST",
+      url: `/api/orders/${beforeOrderDate.json().order.id}/fulfill`,
+      headers: auth(ownerToken),
+      payload: { fulfilledAt: new Date(Date.now() + 6 * 60_000).toISOString() },
+    });
+    expect(rejectedFuture.statusCode).toBe(400);
+    expect(rejectedFuture.json().error.code).toBe("FULFILLMENT_IN_FUTURE");
   });
 
   it("requires explicit fulfillment and calculates three months by calendar month", async () => {
@@ -821,6 +906,24 @@ describe.sequential("commercial settlement API", () => {
     );
     expect(immutableReversal.rows[0]?.reason).toBe("银行流水对应错订单");
 
+    const originalPayment = await database.query<{ note: string }>(
+      "SELECT note FROM payments WHERE tenant_id = $1 AND id = $2",
+      [DEMO_IDS.tenant, paymentId],
+    );
+    await expect(database.query(
+      "UPDATE payments SET note = '篡改付款备注' WHERE tenant_id = $1 AND id = $2",
+      [DEMO_IDS.tenant, paymentId],
+    )).rejects.toThrow();
+    await expect(database.query(
+      "DELETE FROM payments WHERE tenant_id = $1 AND id = $2",
+      [DEMO_IDS.tenant, paymentId],
+    )).rejects.toThrow();
+    const immutablePayment = await database.query<{ note: string }>(
+      "SELECT note FROM payments WHERE tenant_id = $1 AND id = $2",
+      [DEMO_IDS.tenant, paymentId],
+    );
+    expect(immutablePayment.rows[0]?.note).toBe(originalPayment.rows[0]?.note);
+
     const tooLargeReplacement = await app.inject({
       method: "POST",
       url: `/api/orders/${order.id}/payments`,
@@ -983,10 +1086,10 @@ describe.sequential("commercial settlement API", () => {
       },
       {
         orderNo: "CALENDAR-YEAR-001",
-        orderDate: "2026-12-31",
+        orderDate: "2023-12-31",
         months: 2,
-        fulfilledAt: "2026-12-31T08:00:00+08:00",
-        expectedDueAt: "2027-02-28T00:00:00.000Z",
+        fulfilledAt: "2023-12-31T08:00:00+08:00",
+        expectedDueAt: "2024-02-29T00:00:00.000Z",
       },
     ];
 
@@ -1135,6 +1238,21 @@ describe.sequential("commercial settlement API", () => {
     expect(response.json().audit.some((entry: { action: string; entityId: string }) =>
       entry.action === "partner.updated" && entry.entityId === createdPartnerId)).toBe(true);
 
+    const auditRecord = response.json().audit[0] as { id: string; action: string };
+    await expect(database.query(
+      "UPDATE audit_logs SET action = 'tampered' WHERE tenant_id = $1 AND id = $2",
+      [DEMO_IDS.tenant, auditRecord.id],
+    )).rejects.toThrow();
+    await expect(database.query(
+      "DELETE FROM audit_logs WHERE tenant_id = $1 AND id = $2",
+      [DEMO_IDS.tenant, auditRecord.id],
+    )).rejects.toThrow();
+    const immutableAudit = await database.query<{ action: string }>(
+      "SELECT action FROM audit_logs WHERE tenant_id = $1 AND id = $2",
+      [DEMO_IDS.tenant, auditRecord.id],
+    );
+    expect(immutableAudit.rows[0]?.action).toBe(auditRecord.action);
+
     const viewerAudit = await app.inject({ method: "GET", url: "/api/audit", headers: auth(viewerToken) });
     expect(viewerAudit.statusCode).toBe(403);
   });
@@ -1255,33 +1373,103 @@ describe.sequential("commercial settlement API", () => {
     await rateApp.close();
   });
 
+  it("hashes the IP, phone, and combined login limit keys", async () => {
+    const cache = new CapturingCache();
+    const rateApp = buildApp({ database, cache, loginRateLimitMax: 5, publicOrigin: PUBLIC_ORIGIN });
+    await rateApp.ready();
+    const response = await rateApp.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      remoteAddress: "203.0.113.25",
+      payload: { phone: "13512345678", password: "wrong-password" },
+    });
+    expect(response.statusCode).toBe(401);
+    expect(cache.rules[0]).toHaveLength(3);
+    expect(cache.rules[0]?.map((rule) => rule.key)).toEqual([
+      expect.stringMatching(/^rate-limit:login:ip:[a-f0-9]{64}$/),
+      expect.stringMatching(/^rate-limit:login:phone:[a-f0-9]{64}$/),
+      expect.stringMatching(/^rate-limit:login:ip-phone:[a-f0-9]{64}$/),
+    ]);
+    expect(JSON.stringify(cache.rules[0])).not.toContain("203.0.113.25");
+    expect(JSON.stringify(cache.rules[0])).not.toContain("13512345678");
+    await rateApp.close();
+    await cache.close();
+  });
+
+  it("shares login limits across application instances using the same cache", async () => {
+    const sharedCache = new NoopCache();
+    const firstApp = buildApp({ database, cache: sharedCache, loginRateLimitMax: 1, publicOrigin: PUBLIC_ORIGIN });
+    const secondApp = buildApp({ database, cache: sharedCache, loginRateLimitMax: 1, publicOrigin: PUBLIC_ORIGIN });
+    await Promise.all([firstApp.ready(), secondApp.ready()]);
+    const request = {
+      method: "POST" as const,
+      url: "/api/auth/login",
+      remoteAddress: "198.51.100.50",
+      payload: { phone: "13599999999", password: "wrong-password" },
+    };
+    const first = await firstApp.inject(request);
+    const second = await secondApp.inject(request);
+    expect([first.statusCode, second.statusCode]).toEqual([401, 429]);
+    await Promise.all([firstApp.close(), secondApp.close()]);
+    await sharedCache.close();
+  });
+
+  it("fails closed when the shared login limiter is unavailable", async () => {
+    const rateApp = buildApp({
+      database,
+      cache: new UnavailableRateLimitCache(),
+      loginRateLimitMax: 1,
+      publicOrigin: PUBLIC_ORIGIN,
+    });
+    await rateApp.ready();
+    const response = await rateApp.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { phone: "13588888888", password: "wrong-password" },
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error.code).toBe("LOGIN_RATE_LIMIT_UNAVAILABLE");
+    expect(response.headers["retry-after"]).toBe("1");
+    await rateApp.close();
+  });
+
   it("trusts forwarded client IPs only from a loopback reverse proxy", async () => {
-    const loopbackProxyApp = buildApp({ database, loginRateLimitMax: 1, publicOrigin: PUBLIC_ORIGIN });
+    const loopbackProxyApp = buildApp({
+      database,
+      loginRateLimitMax: 1,
+      loginRateLimitIpMax: 1,
+      publicOrigin: PUBLIC_ORIGIN,
+    });
     await loopbackProxyApp.ready();
-    const throughLoopback = async (forwardedFor: string) => loopbackProxyApp.inject({
+    const throughLoopback = async (forwardedFor: string, phone: string) => loopbackProxyApp.inject({
       method: "POST",
       url: "/api/auth/login",
       remoteAddress: "127.0.0.1",
       headers: { "x-forwarded-for": forwardedFor },
-      payload: { phone: "13500000000", password: "wrong-password" },
+      payload: { phone, password: "wrong-password" },
     });
-    const clientOne = await throughLoopback("198.51.100.1");
-    const clientTwo = await throughLoopback("198.51.100.2");
-    const clientOneAgain = await throughLoopback("198.51.100.1");
+    const clientOne = await throughLoopback("198.51.100.1", "13500000000");
+    const clientTwo = await throughLoopback("198.51.100.2", "13500000001");
+    const clientOneAgain = await throughLoopback("198.51.100.1", "13500000000");
     expect([clientOne.statusCode, clientTwo.statusCode, clientOneAgain.statusCode]).toEqual([401, 401, 429]);
     await loopbackProxyApp.close();
 
-    const directApp = buildApp({ database, loginRateLimitMax: 1, publicOrigin: PUBLIC_ORIGIN });
+    const directApp = buildApp({
+      database,
+      loginRateLimitMax: 1,
+      loginRateLimitIpMax: 1,
+      publicOrigin: PUBLIC_ORIGIN,
+    });
     await directApp.ready();
-    const directRequest = async (forwardedFor: string) => directApp.inject({
+    const directRequest = async (forwardedFor: string, phone: string) => directApp.inject({
       method: "POST",
       url: "/api/auth/login",
       remoteAddress: "203.0.113.10",
       headers: { "x-forwarded-for": forwardedFor },
-      payload: { phone: "13400000000", password: "wrong-password" },
+      payload: { phone, password: "wrong-password" },
     });
-    const forgedOne = await directRequest("198.51.100.10");
-    const forgedTwo = await directRequest("198.51.100.11");
+    const forgedOne = await directRequest("198.51.100.10", "13400000000");
+    const forgedTwo = await directRequest("198.51.100.11", "13400000001");
     expect([forgedOne.statusCode, forgedTwo.statusCode]).toEqual([401, 429]);
     await directApp.close();
   });

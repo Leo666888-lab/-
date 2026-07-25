@@ -62,8 +62,27 @@ cp -a "${REPOSITORY_ROOT}/dist" "${REPOSITORY_ROOT}/public" \
   "${REPOSITORY_ROOT}/migrations" "${REPOSITORY_ROOT}/deploy" "${release_root}/"
 
 for required_path in dist/src/server.js dist/src/cli/migrate.js public/index.html \
-  deploy/scripts/siyan-settlement-666-postgres-backup.sh node_modules/fastify; do
+  deploy/scripts/siyan-settlement-666-postgres-backup.sh \
+  deploy/scripts/siyan-settlement-666-preflight.sh \
+  deploy/scripts/siyan-settlement-666-restore-drill.sh \
+  deploy/scripts/siyan-settlement-666-health-check.sh \
+  deploy/scripts/siyan-settlement-666-tls-check.sh \
+  deploy/scripts/siyan-settlement-666-alert.sh \
+  deploy/scripts/parse-postgres-database-url.mjs \
+  deploy/scripts/validate-ops-database-roles.mjs \
+  deploy/scripts/validate-restore-target.mjs \
+  node_modules/fastify; do
   [[ -e "${release_root}/${required_path}" ]] || die "release output is missing: ${required_path}"
+done
+for executable_path in \
+  deploy/scripts/siyan-settlement-666-postgres-backup.sh \
+  deploy/scripts/siyan-settlement-666-preflight.sh \
+  deploy/scripts/siyan-settlement-666-restore-drill.sh \
+  deploy/scripts/siyan-settlement-666-health-check.sh \
+  deploy/scripts/siyan-settlement-666-tls-check.sh \
+  deploy/scripts/siyan-settlement-666-alert.sh; do
+  [[ -x "${release_root}/${executable_path}" ]] \
+    || die "release script is not executable: ${executable_path}"
 done
 
 manifest_temp="${work_dir}/SHA256SUMS"

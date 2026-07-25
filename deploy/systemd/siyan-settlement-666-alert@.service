@@ -1,0 +1,48 @@
+[Unit]
+Description=Operations alert for Siyan Settlement 666 unit %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=siyan-settlement-666-monitor
+Group=siyan-settlement-666-monitor
+SupplementaryGroups=siyan-settlement-666-release
+EnvironmentFile=/etc/siyan-settlement-666/monitor/monitor.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+StateDirectory=siyan-settlement-666-monitor
+StateDirectoryMode=0700
+ExecStart=/usr/bin/bash /opt/siyan-settlement-666/current/deploy/scripts/siyan-settlement-666-alert.sh %i
+TimeoutStartSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=true
+ReadOnlyPaths=/etc/siyan-settlement-666/monitor /opt/siyan-settlement-666/current
+ReadWritePaths=/var/lib/siyan-settlement-666-monitor
+InaccessiblePaths=/etc/siyan-settlement-666/app /etc/siyan-settlement-666/backup /var/backups/siyan-settlement-666 /var/lib/siyan-settlement-666
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=siyan-settlement-666-alert

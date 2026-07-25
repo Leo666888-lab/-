@@ -3,8 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#147d6f" />
-    <title>思燕结算台 · 商业版</title>
+    <meta name="theme-color" content="#ff6900" />
+    <title>思燕结算台｜思燕家居</title>
+    <link rel="icon" type="image/png" sizes="64x64" href="./assets/favicon-64.png" />
     <link rel="stylesheet" href="styles.css" />
     <script src="./vendor/lucide.js" defer></script>
   </head>
@@ -14,22 +15,23 @@
 
     <section id="loginScreen" class="login-screen">
       <div class="login-story">
-        <div class="story-brand"><span class="brand-mark">思</span><span>思燕结算台</span></div>
+        <div class="story-brand"><img class="brand-mark" src="./assets/siyan-mark.png" width="34" height="34" alt="" /><span>思燕家居</span></div>
         <div class="story-copy">
           <p class="eyebrow">SIYAN SETTLEMENT DESK</p>
-          <h1>每一笔货款，<br /><em>都有着落。</em></h1>
-          <p>把订单、交货、收付款和提醒放在一条清楚的线上，家里人打开就会用。</p>
+          <h1>思燕结算台</h1>
+          <p class="story-promise">每一笔货款，都有着落。</p>
+          <p class="story-description">清楚管理订单、交货、分次收付款和账期。</p>
         </div>
-        <div class="story-foot"><span class="status-dot"></span> 商业功能验证环境 · 数据来自企业账本 API</div>
+        <div class="story-foot"><span class="status-dot"></span> 企业结算管理系统</div>
       </div>
       <div class="login-panel">
         <div class="login-heading">
-          <span class="brand-mark small">思</span>
-          <div><strong>欢迎回来</strong><span>登录你的企业账本</span></div>
+          <img class="brand-mark small" src="./assets/siyan-mark.png" width="32" height="32" alt="" />
+          <div><strong id="loginHeadingTitle">欢迎回来</strong><span id="loginHeadingSubtitle">登录你的企业账本</span></div>
         </div>
         <div class="auth-tabs" aria-label="登录方式">
           <span class="auth-tab active">密码登录</span>
-          <span class="integration-tag">短信登录待接入</span>
+          <span id="smsLoginTag" class="integration-tag">短信登录待接入</span>
         </div>
         <form id="loginForm" class="login-form">
           <label>手机号<input id="loginPhone" type="tel" inputmode="tel" autocomplete="username" required /></label>
@@ -38,15 +40,23 @@
           <div class="login-options"><span class="security-note"><i data-lucide="shield-check"></i>安全会话，不在浏览器长期保存密码或令牌</span><button class="text-button" type="button" data-action="fill-test-account">填入本地测试账号</button></div>
           <button id="loginSubmit" class="primary-button wide" type="submit"><i data-lucide="arrow-right"></i>进入结算台</button>
         </form>
-        <p class="login-note">测试账号仅适用于本地种子数据，生产环境必须关闭测试数据。</p>
+        <form id="invitationForm" class="login-form hidden">
+          <input id="invitationToken" type="hidden" />
+          <div class="invitation-intro"><i data-lucide="user-check"></i><div><strong>接受企业邀请</strong><span>设置密码后即可加入企业账本</span></div></div>
+          <label>设置密码<input id="invitationPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /><span class="field-hint">至少 12 位，请勿与其他网站共用</span></label>
+          <label>确认密码<input id="invitationPasswordConfirm" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /></label>
+          <p id="invitationError" class="form-error hidden"></p>
+          <button id="invitationSubmit" class="primary-button wide" type="submit"><i data-lucide="user-check"></i>接受邀请并设置密码</button>
+        </form>
+        <p id="loginNote" class="login-note">测试账号仅适用于本地种子数据，生产环境必须关闭测试数据。</p>
       </div>
     </section>
 
     <div id="appShell" class="app-shell hidden">
       <button id="sidebarScrim" class="sidebar-scrim hidden" type="button" aria-label="关闭菜单"></button>
       <aside id="sidebar" class="sidebar">
-        <div class="sidebar-brand"><span class="brand-mark">思</span><div><strong>思燕结算台</strong><span>企业收付管理</span></div><button id="sidebarClose" class="icon-button mobile-only" type="button" aria-label="关闭菜单"><i data-lucide="x"></i></button></div>
-        <div class="workspace-switch"><span id="workspaceAvatar" class="workspace-avatar">企</span><div><strong id="workspaceName">企业账本</strong><span id="workspaceMeta">正在连接</span></div><i data-lucide="building-2"></i></div>
+        <div class="sidebar-brand"><img class="brand-mark" src="./assets/siyan-mark.png" width="34" height="34" alt="" /><div><strong>思燕家居</strong><span>思燕结算台</span></div><button id="sidebarClose" class="icon-button mobile-only" type="button" aria-label="关闭菜单"><i data-lucide="x"></i></button></div>
+        <div id="workspaceIdentity" class="workspace-switch" aria-label="当前企业"><span id="workspaceAvatar" class="workspace-avatar" aria-hidden="true"><i data-lucide="building-2"></i></span><div><strong id="workspaceName">企业账本</strong><span id="workspaceMeta">正在连接</span></div></div>
         <nav class="side-nav" aria-label="主导航">
           <p class="nav-label">工作台</p>
           <button class="nav-item active" data-view="overview"><i data-lucide="layout-dashboard"></i><span>结算总览</span><b class="nav-count" data-nav-count="overview">0</b></button>
@@ -56,7 +66,7 @@
           <p class="nav-label">资料与工具</p>
           <button class="nav-item" data-view="contacts"><i data-lucide="contact"></i><span>客户/供应商</span></button>
           <button class="nav-item" data-view="reminders"><i data-lucide="bell-ring"></i><span>提醒中心</span><b class="nav-count" data-nav-count="reminders">0</b></button>
-          <button class="nav-item" data-view="imports"><i data-lucide="file-up"></i><span>导入数据</span><span class="nav-new">待接入</span></button>
+          <button class="nav-item" data-view="imports"><i data-lucide="file-up"></i><span>导入数据</span><span class="nav-ready">可用</span></button>
           <button class="nav-item" data-view="ocr"><i data-lucide="scan-line"></i><span>纸单识别</span><span class="nav-new">测试</span></button>
         </nav>
         <div class="sidebar-footer"><button class="nav-item" data-view="settings"><i data-lucide="settings-2"></i><span>工作区设置</span></button><button id="logoutButton" class="logout-button"><i data-lucide="log-out"></i>退出登录</button></div>
@@ -82,6 +92,7 @@
       <nav class="mobile-bottom-nav" aria-label="手机快捷导航">
         <button class="mobile-nav-item active" data-view="overview"><i data-lucide="layout-dashboard"></i><span>总览</span></button>
         <button class="mobile-nav-item" data-view="receivable"><i data-lucide="arrow-down-left"></i><span>应收</span><b data-mobile-count="receivable">0</b></button>
+        <button class="mobile-nav-item" data-view="orders"><i data-lucide="file-text"></i><span>订单</span></button>
         <button class="mobile-nav-item" data-view="payable"><i data-lucide="arrow-up-right"></i><span>应付</span><b data-mobile-count="payable">0</b></button>
         <button class="mobile-nav-item" data-view="reminders"><i data-lucide="bell-ring"></i><span>提醒</span><b data-mobile-count="reminders">0</b></button>
       </nav>
@@ -97,15 +108,26 @@
             <label>订单编号<input id="orderNumber" required /><span class="field-hint">自动生成，可人工修改</span></label>
             <label>订货日期<input id="orderDate" type="date" required /></label>
             <label>计划交货/收货日期<input id="plannedDeliveryDate" type="date" /></label>
-            <label>结算周期<select id="settlementCycle"><option value="days:0">交货即结</option><option value="days:7">交货后 7 天</option><option value="days:30" selected>交货后 30 天</option><option value="months:3">交货后 3 个月</option><option value="custom">自定义天数</option></select></label>
+            <label id="editFulfilledAtField" class="hidden">实际交货/收货时间<input id="editFulfilledAt" type="datetime-local" /></label>
+            <label>结算周期<select id="settlementCycle"><option value="days:0">交货即结</option><option value="days:7">交货后 7 天</option><option value="days:30" selected>交货后 30 天</option><option value="months:1">交货后 1 个月</option><option value="months:2">交货后 2 个月</option><option value="months:3">交货后 3 个月</option><option value="custom">自定义天数</option></select></label>
             <label id="customSettlementField" class="hidden">自定义账期（天）<input id="customSettlementDays" type="number" min="0" max="3650" value="30" /></label>
             <label>币种<select id="orderCurrency"><option value="CNY">CNY 人民币</option><option value="USD">USD 美元</option><option value="AED">AED 迪拉姆</option><option value="SAR">SAR 沙特里亚尔</option></select></label>
             <label class="full">订单备注<textarea id="orderNotes" rows="2" maxlength="2000" placeholder="可填写客户要求、装箱说明等"></textarea></label>
+            <label id="correctionReasonField" class="full hidden">更正原因<textarea id="correctionReason" rows="2" maxlength="2000" placeholder="例如：与纸质原单复核后发现数量录错"></textarea><span class="field-hint">原因会永久保留在订单更正记录和审计日志中。</span></label>
           </div>
+          <div id="correctionWarning" class="pending-note important hidden"><i data-lucide="history"></i><div><strong>这是受控更正，不会覆盖历史</strong><span>系统会保存更正前后快照。有收付款历史时，往来单位、方向和币种不可修改。</span></div></div>
           <div class="line-items-heading"><div><h3>商品明细</h3><span>服务端会按数量和单价重新计算订单总额</span></div><button id="addLineItem" class="outline-button small-button" type="button"><i data-lucide="plus"></i>添加商品</button></div>
           <div class="line-items-wrap"><table class="line-items-table commercial-lines"><thead><tr><th>商品说明</th><th>数量</th><th>单价</th><th>小计</th><th></th></tr></thead><tbody id="lineItemsBody"></tbody></table></div>
-          <div class="order-submit-bar"><div class="order-total"><span>订单总金额</span><strong id="orderTotal">¥0.00</strong></div><div class="modal-footer"><button class="outline-button close-modal" data-close="orderModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="check"></i>保存订单</button></div></div>
+          <div class="order-submit-bar"><div class="order-total"><span>订单总金额</span><strong id="orderTotal">¥0.00</strong></div><div class="modal-footer"><button class="outline-button close-modal" data-close="orderModal" type="button">取消</button><button id="orderSubmitButton" class="primary-button" type="submit"><i data-lucide="check"></i><span>保存订单</span></button></div></div>
         </form>
+      </section>
+    </div>
+
+    <div id="paymentQueueModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal payment-queue-modal" role="dialog" aria-modal="true" aria-labelledby="paymentQueueModalTitle">
+        <div class="modal-header"><div><p class="eyebrow">QUICK SETTLEMENT</p><h2 id="paymentQueueModalTitle">登记收付款</h2></div><button class="icon-button close-modal" data-close="paymentQueueModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <div class="payment-queue-toolbar"><div class="search-box"><i data-lucide="search"></i><input id="paymentQueueSearch" aria-label="搜索待结算订单" placeholder="搜索往来单位、订单号" /></div><span id="paymentQueueCount"></span></div>
+        <div id="paymentQueueList" class="payment-queue-list"></div>
       </section>
     </div>
 
@@ -143,6 +165,13 @@
       <section class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="passwordModalTitle">
         <div class="modal-header"><div><p class="eyebrow">ACCOUNT SECURITY</p><h2 id="passwordModalTitle">修改密码</h2></div><button class="icon-button close-modal" data-close="passwordModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
         <form id="passwordForm" class="stack-form"><label>当前密码<input id="currentPassword" type="password" autocomplete="current-password" required /></label><label>新密码<input id="newPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /><span class="field-hint">至少 12 位</span></label><label>确认新密码<input id="confirmPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /></label><div class="pending-note important"><i data-lucide="shield-check"></i><div><strong>修改后保留当前会话</strong><span>服务器会撤销该账号的其他登录会话。</span></div></div><div class="modal-footer"><button class="outline-button close-modal" data-close="passwordModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="key-round"></i>确认修改</button></div></form>
+      </section>
+    </div>
+
+    <div id="memberModal" class="modal-backdrop hidden" aria-hidden="true">
+      <section class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="memberModalTitle">
+        <div class="modal-header"><div><p class="eyebrow">INVITE MEMBER</p><h2 id="memberModalTitle">邀请企业成员</h2></div><button class="icon-button close-modal" data-close="memberModal" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <form id="memberForm" class="stack-form"><label>姓名<input id="memberDisplayName" maxlength="100" dir="auto" required /></label><label>手机号<input id="memberPhone" type="tel" maxlength="32" inputmode="tel" autocomplete="off" required /></label><label>角色<select id="memberRole"><option value="finance">财务</option><option value="sales">业务</option><option value="viewer">只读成员</option><option value="owner">负责人</option></select><span class="field-hint">负责人可管理成员；财务可登记和冲销收付款。</span></label><div class="pending-note important"><i data-lucide="link-2"></i><div><strong>系统生成一次性邀请链接</strong><span>链接 72 小时有效，明文只在创建成功后显示一次。</span></div></div><div class="modal-footer"><button class="outline-button close-modal" data-close="memberModal" type="button">取消</button><button class="primary-button" type="submit"><i data-lucide="send"></i>生成邀请</button></div></form>
       </section>
     </div>
 
