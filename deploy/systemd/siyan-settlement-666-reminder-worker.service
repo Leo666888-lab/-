@@ -14,9 +14,9 @@ SupplementaryGroups=siyan-settlement-666-release
 WorkingDirectory=/opt/siyan-settlement-666/current
 EnvironmentFile=/etc/siyan-settlement-666/app/app.env
 
-ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/app/app.env
-ExecStartPre=/usr/bin/test -r /opt/siyan-settlement-666/current/dist/src/worker.js
-ExecStartPre=/usr/bin/test -x /opt/siyan-settlement-666/runtime/node/bin/node
+ExecStartPre=/usr/bin/bash -c '[[ -r /etc/siyan-settlement-666/app/app.env ]]'
+ExecStartPre=/usr/bin/bash -c '[[ -r /opt/siyan-settlement-666/current/dist/src/worker.js ]]'
+ExecStartPre=/usr/bin/bash -c '[[ -x /opt/siyan-settlement-666/runtime/node/bin/node ]]'
 ExecStart=/usr/bin/env NODE_ENV=production SEED_DEMO=false /opt/siyan-settlement-666/runtime/node/bin/node /opt/siyan-settlement-666/current/dist/src/worker.js
 
 Restart=on-failure

@@ -14,10 +14,10 @@ SupplementaryGroups=siyan-settlement-666-release
 WorkingDirectory=/opt/siyan-settlement-666/current
 EnvironmentFile=/etc/siyan-settlement-666/app/app.env
 
-ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/app/app.env
-ExecStartPre=/usr/bin/test -r /opt/siyan-settlement-666/current/dist/src/server.js
-ExecStartPre=/usr/bin/test -x /opt/siyan-settlement-666/runtime/node/bin/node
-ExecStartPre=/usr/bin/test -x /usr/bin/env
+ExecStartPre=/usr/bin/bash -c '[[ -r /etc/siyan-settlement-666/app/app.env ]]'
+ExecStartPre=/usr/bin/bash -c '[[ -r /opt/siyan-settlement-666/current/dist/src/server.js ]]'
+ExecStartPre=/usr/bin/bash -c '[[ -x /opt/siyan-settlement-666/runtime/node/bin/node ]]'
+ExecStartPre=/usr/bin/bash -c '[[ -x /usr/bin/env ]]'
 # env arguments override conflicting values from EnvironmentFile.
 ExecStart=/usr/bin/env NODE_ENV=production HOST=127.0.0.1 PORT=16666 SEED_DEMO=false PUBLIC_ORIGIN=https://123.56.254.236:666 /opt/siyan-settlement-666/runtime/node/bin/node /opt/siyan-settlement-666/current/dist/src/server.js
 

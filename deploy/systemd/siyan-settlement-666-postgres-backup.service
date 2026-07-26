@@ -14,10 +14,10 @@ WorkingDirectory=/var/backups/siyan-settlement-666
 EnvironmentFile=/etc/siyan-settlement-666/backup/backup.env
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
-ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/backup/backup.env
-ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/backup/backup.age-recipient
-ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666/backup/rclone.conf
-ExecStartPre=/usr/bin/test -w /var/backups/siyan-settlement-666
+ExecStartPre=/usr/bin/bash -c '[[ -r /etc/siyan-settlement-666/backup/backup.env ]]'
+ExecStartPre=/usr/bin/bash -c '[[ -r /etc/siyan-settlement-666/backup/backup.age-recipient ]]'
+ExecStartPre=/usr/bin/bash -c '[[ -r /etc/siyan-settlement-666/backup/rclone.conf ]]'
+ExecStartPre=/usr/bin/bash -c '[[ -w /var/backups/siyan-settlement-666 ]]'
 ExecStart=/usr/bin/bash /opt/siyan-settlement-666/current/deploy/scripts/siyan-settlement-666-postgres-backup.sh
 
 TimeoutStartSec=2h
