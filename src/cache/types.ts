@@ -16,12 +16,20 @@ export interface FixedWindowResult {
   retryAfterSeconds: number;
 }
 
+export type OneTimeValueStatus = "consumed" | "mismatch" | "exhausted" | "missing";
+
+export interface OneTimeValueResult {
+  status: OneTimeValueStatus;
+  remainingAttempts: number;
+}
+
 export interface Cache {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, ttlSeconds: number): Promise<void>;
   setIfAbsent(key: string, value: string, ttlSeconds: number): Promise<boolean>;
   delete(key: string): Promise<boolean>;
   consumeFixedWindow(rules: readonly FixedWindowRule[], windowSeconds: number): Promise<FixedWindowResult>;
+  consumeOneTimeValue(key: string, expectedValue: string, maxAttempts: number): Promise<OneTimeValueResult>;
   readiness(): Promise<CacheReadiness>;
   close(): Promise<void>;
 }
@@ -44,5 +52,13 @@ export function validateCacheEntry(key: string, ttlSeconds?: number): void {
   if (!key) throw new TypeError("cache key must not be empty");
   if (ttlSeconds !== undefined && (!Number.isSafeInteger(ttlSeconds) || ttlSeconds <= 0)) {
     throw new TypeError("cache TTL must be a positive integer");
+  }
+}
+
+export function validateOneTimeValue(key: string, expectedValue: string, maxAttempts: number): void {
+  validateCacheEntry(key);
+  if (!expectedValue) throw new TypeError("expected one-time value must not be empty");
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new TypeError("one-time value max attempts must be a positive integer");
   }
 }

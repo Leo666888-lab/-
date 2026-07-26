@@ -217,6 +217,37 @@ test("uses real API mutations and never persists session tokens in browser stora
   assert.doesNotMatch(appSource, /applyDemoImport|state\.orders\.(?:push|unshift)/);
 });
 
+test("provides accessible password and SMS login with server-controlled resend cooldown", () => {
+  assert.match(indexSource, /id="authTabs"[^>]*role="tablist"/);
+  assert.match(indexSource, /id="passwordLoginTab"[^>]*role="tab"[^>]*aria-controls="loginForm"/);
+  assert.match(indexSource, /id="smsLoginTab"[^>]*role="tab"[^>]*aria-controls="smsLoginForm"/);
+  assert.match(indexSource, /id="smsLoginCode"[^>]*autocomplete="one-time-code"[^>]*pattern="\[0-9\]\{6\}"/);
+  assert.match(indexSource, /id="smsCodeStatus"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(indexSource, /id="smsLoginError"[^>]*role="alert"[^>]*aria-live="assertive"/);
+  assert.match(appSource, /"\/api\/auth\/sms-codes"/);
+  assert.match(appSource, /"\/api\/auth\/sms-login"/);
+  assert.match(appSource, /response\.headers\.get\("retry-after"\)/);
+  assert.match(appSource, /startSmsCountdown\(error\.retryAfterSeconds\)/);
+  assert.match(appSource, /setAttribute\("aria-selected", String\(active\)\)/);
+  assert.match(appSource, /\["ArrowLeft", "ArrowRight", "Home", "End"\]/);
+  assert.doesNotMatch(`${indexSource}\n${appSource}`, /testCode|固定验证码|测试验证码/);
+});
+
+test("keeps mobile order actions inside the full-width card action row", () => {
+  assert.match(
+    stylesSource,
+    /@media \(max-width: 760px\)[\s\S]*\.view \.data-table \.actions-cell \{ width: 100%; \}/,
+  );
+  assert.match(
+    stylesSource,
+    /@media \(max-width: 430px\)[\s\S]*\.payment-summary-grid b \{[^}]*white-space: nowrap;/,
+  );
+  assert.match(
+    stylesSource,
+    /@media \(max-width: 320px\)[\s\S]*\.payment-summary-grid \.remaining \{ grid-column: 1 \/ -1; \}/,
+  );
+});
+
 test("is CSP-friendly and self-hosts visual dependencies", () => {
   assert.match(indexSource, /<meta charset="UTF-8"/);
   assert.match(indexSource, /src="\.\/vendor\/lucide\.js"/);
@@ -353,6 +384,36 @@ test("renders server-backed audit history without exposing sensitive request key
   const auditDetailSource = appSource.slice(appSource.indexOf("function auditDetail"), appSource.indexOf("function auditPanelMarkup"));
   assert.doesNotMatch(auditDetailSource, /idempotencyKey|sessionId|token/);
   assert.match(stylesSource, /\.audit-row\s*\{/);
+});
+
+test("provides private, versioned reminder preferences only to finance roles", () => {
+  assert.match(appSource, /apiRequest\("\/api\/notification-settings\/me"/);
+  assert.match(appSource, /method:\s*"PUT"/);
+  assert.match(appSource, /sendLocalTime:\s*"09:00"/);
+  assert.match(appSource, /version:\s*state\.notificationSettings\.preference\.version/);
+  assert.match(appSource, /preference\.version\) && preference\.version >= 0/);
+  assert.match(appSource, /state\.data\.role === "owner" \|\| state\.data\.role === "finance"/);
+  assert.match(appSource, /canReadAudit \? notificationSettingsPanelMarkup\(\) : ""/);
+  assert.match(appSource, /id="notificationEnabled"[^>]*role="switch"/);
+  assert.match(appSource, /id="notificationSendLocalTime" type="time"/);
+  assert.match(appSource, /id="notificationAdvanceDays" type="number"/);
+  assert.match(appSource, /id="notificationReceivableEnabled" type="checkbox"/);
+  assert.match(appSource, /id="notificationPayableEnabled" type="checkbox"/);
+  assert.match(appSource, /id="notificationOverdueDaily" type="checkbox"/);
+  assert.match(appSource, /!settings\.eligible \|\| !settings\.phoneVerified/);
+  assert.match(appSource, /请先通过短信验证码登录完成验证，再开启提醒/);
+  assert.match(appSource, /正在保存提醒设置/);
+  assert.match(appSource, /提醒设置已保存/);
+  assert.match(appSource, /notificationSettingsSaveStatus === "error"/);
+  assert.match(appSource, /phoneMasked:\s*safeMaskedPhone\(payload\?\.phoneMasked\)/);
+  const notificationPanelSource = appSource.slice(
+    appSource.indexOf("function notificationSettingsPanelMarkup"),
+    appSource.indexOf("function captureNotificationPreferenceDraft"),
+  );
+  assert.doesNotMatch(notificationPanelSource, /user\.phone|state\.data\.user\.phone/);
+  assert.match(stylesSource, /\.notification-preference-grid\s*\{/);
+  assert.match(stylesSource, /@media \(max-width: 430px\)[\s\S]*\.notification-preference-grid \{ grid-template-columns: 1fr; \}/);
+  assert.match(stylesSource, /\.switch input:focus-visible \+ span/);
 });
 
 test("provides owner-managed invitations, roles, and account status controls", () => {

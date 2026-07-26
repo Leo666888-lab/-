@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ const repositoryFile = (path: string) => fileURLToPath(new URL(`../${path}`, imp
 const readRepositoryFile = (path: string) => readFileSync(repositoryFile(path), "utf8");
 const restoreValidator = repositoryFile("deploy/scripts/validate-restore-target.mjs");
 const roleValidator = repositoryFile("deploy/scripts/validate-ops-database-roles.mjs");
+const activateRelease = repositoryFile("deploy/scripts/siyan-settlement-666-activate-release.sh");
 
 const runValidator = (script: string, env: Record<string, string>) => spawnSync(
   process.execPath,
@@ -46,29 +47,48 @@ describe("deployment identity and secret isolation", () => {
 
   it("requires different application and backup database credentials without echoing them", () => {
     const valid = runValidator(roleValidator, {
-      APP_DATABASE_URL: "postgresql://siyan_app:app-secret@db.test/settlement",
-      BACKUP_DATABASE_URL: "postgresql://siyan_backup:backup-secret@db.test/settlement",
+      APP_DATABASE_URL: "postgresql://siyan_app:app-secret@db.test/settlement?sslmode=require",
+      BACKUP_DATABASE_URL: "postgresql://siyan_backup:backup-secret@db.test/settlement?sslmode=require",
     });
     expect(valid.status).toBe(0);
 
+    const plaintext = runValidator(roleValidator, {
+      APP_DATABASE_URL: "postgresql://siyan_app:app-secret@db.test/settlement",
+      BACKUP_DATABASE_URL: "postgresql://siyan_backup:backup-secret@db.test/settlement?sslmode=require",
+    });
+    expect(plaintext.status).not.toBe(0);
+    expect(plaintext.stderr).toMatch(/require PostgreSQL SSL/);
+
+    const disabledTls = runValidator(roleValidator, {
+      APP_DATABASE_URL: "postgresql://siyan_app:app-secret@db.test/settlement?sslmode=disable",
+      BACKUP_DATABASE_URL: "postgresql://siyan_backup:backup-secret@db.test/settlement?sslmode=require",
+    });
+    expect(disabledTls.status).not.toBe(0);
+
+    const ambiguousTls = runValidator(roleValidator, {
+      APP_DATABASE_URL: "postgresql://siyan_app:app-secret@db.test/settlement?sslmode=require&sslmode=disable",
+      BACKUP_DATABASE_URL: "postgresql://siyan_backup:backup-secret@db.test/settlement?sslmode=require",
+    });
+    expect(ambiguousTls.status).not.toBe(0);
+
     const sharedUser = runValidator(roleValidator, {
-      APP_DATABASE_URL: "postgresql://shared:app-secret@db.test/settlement",
-      BACKUP_DATABASE_URL: "postgresql://shared:backup-secret@db.test/settlement",
+      APP_DATABASE_URL: "postgresql://shared:app-secret@db.test/settlement?sslmode=require",
+      BACKUP_DATABASE_URL: "postgresql://shared:backup-secret@db.test/settlement?sslmode=require",
     });
     expect(sharedUser.status).not.toBe(0);
 
     const secret = "never-echo-this-database-secret";
     const sharedPassword = runValidator(roleValidator, {
-      APP_DATABASE_URL: `postgresql://siyan_app:${secret}@db.test/settlement`,
-      BACKUP_DATABASE_URL: `postgresql://siyan_backup:${secret}@db.test/settlement`,
+      APP_DATABASE_URL: `postgresql://siyan_app:${secret}@db.test/settlement?sslmode=require`,
+      BACKUP_DATABASE_URL: `postgresql://siyan_backup:${secret}@db.test/settlement?sslmode=require`,
     });
     expect(sharedPassword.status).not.toBe(0);
     expect(sharedPassword.stderr).not.toContain(secret);
     expect(sharedPassword.stdout).not.toContain(secret);
 
     const differentDatabase = runValidator(roleValidator, {
-      APP_DATABASE_URL: "postgresql://siyan_app:app-secret@db.test/settlement",
-      BACKUP_DATABASE_URL: "postgresql://siyan_backup:backup-secret@db.test/other",
+      APP_DATABASE_URL: "postgresql://siyan_app:app-secret@db.test/settlement?sslmode=require",
+      BACKUP_DATABASE_URL: "postgresql://siyan_backup:backup-secret@db.test/other?sslmode=require",
     });
     expect(differentDatabase.status).not.toBe(0);
   });
@@ -85,6 +105,20 @@ describe("deployment identity and secret isolation", () => {
     expect(preflight).toContain('"--tls", "--sni", target.hostname');
     expect(preflight).toContain('"--user", username');
     expect(preflight).toContain('"--raw", "PING"');
+    expect(preflight).toContain("SMS_ENABLED SMS_CODE_HMAC_KEY SMS_CODE_TTL_SECONDS");
+    expect(preflight).toContain("ALIYUN_SMS_SIGN_NAME ALIYUN_SMS_LOGIN_TEMPLATE_CODE");
+    expect(preflight).toContain("ALIYUN_SMS_DIGEST_TEMPLATE_CODE");
+    expect(preflight).toContain("NOTIFICATION_PROVIDER NOTIFICATION_WORKER_NAME NOTIFICATION_POLL_INTERVAL_MS");
+    expect(preflight).toContain('read_bounded_integer "${APP_ENV}" SMS_CODE_TTL_SECONDS 60 600');
+    expect(preflight).toContain('read_bounded_integer "${APP_ENV}" NOTIFICATION_LEASE_SECONDS 30 3600');
+    expect(preflight).toContain("minimum_notification_lease_seconds=$((notification_batch_size * 15 + 30))");
+    expect(preflight).toContain("NOTIFICATION_LEASE_SECONDS must cover NOTIFICATION_BATCH_SIZE * 15 seconds plus 30 seconds");
+    expect(preflight).toContain("NOTIFICATION_PROVIDER must be fake or aliyun");
+    expect(preflight).toContain('read_env_value "${APP_ENV}" RELEASE_ID');
+    expect(preflight).toMatch(
+      /notification_unit in[\s\S]*siyan-settlement-666-reminder-worker\.service[\s\S]*siyan-settlement-666-reminder-worker-health-check\.timer/,
+    );
+    expect(preflight).toContain("fake notification worker and heartbeat timer must remain inactive and disabled in production");
     expect(preflight).not.toMatch(/redis-cli[^\n]*(?:-u|--uri)/);
     expect(preflight).not.toMatch(/(?:printf|echo)[^\n]*(?:redis_url|REDIS_URL|password)/i);
   });
@@ -129,6 +163,83 @@ printf 'PONG\\n'
       expect(plaintext.status).not.toBe(0);
       expect(plaintext.stdout).not.toContain(password);
       expect(plaintext.stderr).not.toContain(password);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("release activation", () => {
+  it("keeps production migrations in the explicit release CLI", () => {
+    const server = readRepositoryFile("src/server.ts");
+    const deploymentGuide = readRepositoryFile("deploy/README.md");
+    expect(server).toContain('if (config.NODE_ENV !== "production")');
+    expect(server).toContain("await migrate(database);");
+    expect(server).toContain("Production migrations run in the release's isolated CLI");
+    expect(deploymentGuide).toContain("不会把旧代码自动切回数据库已经迁移过的结构");
+    expect(deploymentGuide).not.toContain("previous_release=");
+    expect(deploymentGuide).not.toContain("rollback_link=");
+  });
+
+  it("exposes a root-only activation command and a read-only unit validation mode", () => {
+    const script = readRepositoryFile("deploy/scripts/siyan-settlement-666-activate-release.sh");
+    const help = spawnSync(activateRelease, ["--help"], { encoding: "utf8" });
+
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain("--validate-units-only");
+    expect(script).toContain("flock -n 9");
+    expect(script).toContain("sha256sum -c SHA256SUMS");
+    expect(script).toContain('systemctl restart "${WORKER_UNIT}"');
+    expect(script).toContain("assert_unit_uses_release");
+    expect(script).toContain("current remains");
+    expect(script).toContain("forward fix or coordinate a database restore");
+    expect(script).not.toContain("previous_release");
+    expect(script).not.toContain("rollback_link");
+  });
+
+  it("requires an exact bidirectional match between release and installed units", () => {
+    const directory = mkdtempSync(join(tmpdir(), "siyan-unit-validation-"));
+    const releaseDir = join(directory, "release");
+    const releaseSystemd = join(releaseDir, "deploy", "systemd");
+    const installedDir = join(directory, "installed");
+    const serviceName = "siyan-settlement-666.service";
+    const timerName = "siyan-settlement-666-health-check.timer";
+    const serviceText = "[Unit]\nDescription=test app\n[Service]\nExecStart=/bin/true\n";
+    const timerText = "[Unit]\nDescription=test timer\n[Timer]\nOnBootSec=1m\n";
+    try {
+      mkdirSync(releaseSystemd, { recursive: true });
+      mkdirSync(installedDir, { recursive: true });
+      writeFileSync(join(releaseSystemd, serviceName), serviceText, { mode: 0o644 });
+      writeFileSync(join(releaseSystemd, timerName), timerText, { mode: 0o644 });
+      writeFileSync(join(installedDir, serviceName), serviceText, { mode: 0o644 });
+      writeFileSync(join(installedDir, timerName), timerText, { mode: 0o644 });
+
+      const args = ["--validate-units-only", "--release-dir", releaseDir, "--installed-unit-dir", installedDir];
+      const valid = spawnSync(activateRelease, args, { encoding: "utf8" });
+      expect(valid.status).toBe(0);
+
+      writeFileSync(join(installedDir, serviceName), `${serviceText}# changed\n`);
+      const changed = spawnSync(activateRelease, args, { encoding: "utf8" });
+      expect(changed.status).not.toBe(0);
+      expect(changed.stderr).toContain("differs from release");
+
+      writeFileSync(join(installedDir, serviceName), serviceText);
+      rmSync(join(installedDir, timerName));
+      const missing = spawnSync(activateRelease, args, { encoding: "utf8" });
+      expect(missing.status).not.toBe(0);
+      expect(missing.stderr).toContain("unit is missing");
+
+      writeFileSync(join(installedDir, timerName), timerText);
+      writeFileSync(join(installedDir, "siyan-settlement-666-stale.service"), serviceText);
+      const stale = spawnSync(activateRelease, args, { encoding: "utf8" });
+      expect(stale.status).not.toBe(0);
+      expect(stale.stderr).toContain("not present in release");
+
+      rmSync(join(installedDir, "siyan-settlement-666-stale.service"));
+      mkdirSync(join(installedDir, `${serviceName}.d`));
+      const dropIn = spawnSync(activateRelease, args, { encoding: "utf8" });
+      expect(dropIn.status).not.toBe(0);
+      expect(dropIn.stderr).toContain("override or wants link");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -221,6 +332,28 @@ describe("health, TLS, and failure alert operations", () => {
     expect(check).toContain("successful renewal evidence stamp is missing");
     expect(servedVerification).toBeGreaterThan(-1);
     expect(evidenceWrite).toBeGreaterThan(servedVerification);
+  });
+
+  it("ships a disabled-by-default reminder worker with current-release heartbeat monitoring", () => {
+    const worker = readRepositoryFile("deploy/systemd/siyan-settlement-666-reminder-worker.service");
+    const heartbeatService = readRepositoryFile("deploy/systemd/siyan-settlement-666-reminder-worker-health-check.service");
+    const heartbeatTimer = readRepositoryFile("deploy/systemd/siyan-settlement-666-reminder-worker-health-check.timer");
+    const heartbeatScript = readRepositoryFile("deploy/scripts/siyan-settlement-666-reminder-worker-health-check.sh");
+
+    expect(worker).toContain("User=siyan-settlement-666\n");
+    expect(worker).toContain("EnvironmentFile=/etc/siyan-settlement-666/app/app.env");
+    expect(worker).toContain("dist/src/worker.js");
+    expect(worker).toContain("OnFailure=siyan-settlement-666-alert@%n.service");
+    expect(worker).toContain("ProtectSystem=strict");
+    expect(heartbeatService).toContain("User=siyan-settlement-666\n");
+    expect(heartbeatService).toContain("OnFailure=siyan-settlement-666-alert@%n.service");
+    expect(heartbeatTimer).toContain("OnUnitActiveSec=1m");
+    expect(heartbeatScript).toContain("notification_worker_heartbeats");
+    expect(heartbeatScript).toContain("worker_name = :'worker_name'");
+    expect(heartbeatScript).toContain("release_id = :'release_id'");
+    expect(heartbeatScript).toContain("provider <> 'fake'");
+    expect(heartbeatScript).toContain("last_error_at < clock_timestamp()");
+    expect(heartbeatScript).not.toMatch(/(?:printf|echo)[^\n]*(?:DATABASE_URL|password)/i);
   });
 
   it("records verified offsite backups and makes upgrade preflight read-only", () => {

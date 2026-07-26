@@ -114,6 +114,18 @@ read_env_value() {
   [[ -n "${ENV_VALUE}" ]] || die "${key} must not be empty in ${file_path}"
 }
 
+read_bounded_integer() {
+  local file_path="$1"
+  local key="$2"
+  local minimum="$3"
+  local maximum="$4"
+  read_env_value "${file_path}" "${key}"
+  [[ "${ENV_VALUE}" =~ ^[0-9]+$ ]] || die "${key} must be an integer"
+  local parsed_value=$((10#${ENV_VALUE}))
+  (( parsed_value >= minimum && parsed_value <= maximum )) \
+    || die "${key} must be between ${minimum} and ${maximum}"
+}
+
 validate_env_keys() {
   local file_path="$1"
   shift
@@ -168,7 +180,13 @@ expect_owner_mode "${TLS_STAMP}" root "${MONITOR_USER}" 640
 
 validate_env_keys "${APP_ENV}" \
   NODE_ENV HOST PORT DATABASE_URL REDIS_URL REDIS_KEY_PREFIX SEED_DEMO PUBLIC_ORIGIN SESSION_TTL_HOURS \
-  BODY_LIMIT_BYTES LOGIN_RATE_LIMIT_MAX
+  BODY_LIMIT_BYTES LOGIN_RATE_LIMIT_MAX \
+  SMS_ENABLED SMS_CODE_HMAC_KEY SMS_CODE_TTL_SECONDS SMS_RESEND_COOLDOWN_SECONDS \
+  SMS_VERIFY_MAX_ATTEMPTS SMS_SEND_RATE_LIMIT_MAX SMS_SEND_RATE_LIMIT_IP_MAX \
+  SMS_SEND_RATE_LIMIT_WINDOW_SECONDS ALIYUN_SMS_REGION_ID ALIYUN_SMS_ENDPOINT \
+  ALIYUN_SMS_SIGN_NAME ALIYUN_SMS_LOGIN_TEMPLATE_CODE ALIYUN_SMS_DIGEST_TEMPLATE_CODE \
+  NOTIFICATION_PROVIDER NOTIFICATION_WORKER_NAME NOTIFICATION_POLL_INTERVAL_MS NOTIFICATION_BATCH_SIZE \
+  NOTIFICATION_LEASE_SECONDS NOTIFICATION_MAX_ATTEMPTS RELEASE_ID
 validate_env_keys "${BACKUP_ENV}" DATABASE_URL BACKUP_RETENTION_DAYS BACKUP_REMOTE
 validate_env_keys "${MONITOR_ENV}" \
   ALERT_WEBHOOK_URL ALERT_WEBHOOK_BEARER_TOKEN ALERT_COOLDOWN_SECONDS \
@@ -191,25 +209,30 @@ expect_owner_mode "${release_dir}" root "${RELEASE_GROUP}" 750
 for required_path in \
   SHA256SUMS \
   dist/src/server.js \
+  dist/src/worker.js \
   dist/src/cli/migrate.js \
   public/index.html \
   deploy/scripts/parse-postgres-database-url.mjs \
   deploy/scripts/validate-restore-target.mjs \
   deploy/scripts/validate-ops-database-roles.mjs \
   deploy/scripts/siyan-settlement-666-alert.sh \
+  deploy/scripts/siyan-settlement-666-activate-release.sh \
   deploy/scripts/siyan-settlement-666-postgres-backup.sh \
   deploy/scripts/siyan-settlement-666-preflight.sh \
   deploy/scripts/siyan-settlement-666-restore-drill.sh \
   deploy/scripts/siyan-settlement-666-health-check.sh \
+  deploy/scripts/siyan-settlement-666-reminder-worker-health-check.sh \
   deploy/scripts/siyan-settlement-666-tls-check.sh; do
   [[ -r "${release_dir}/${required_path}" ]] || die "release is missing ${required_path}"
 done
 for executable_path in \
   deploy/scripts/siyan-settlement-666-alert.sh \
+  deploy/scripts/siyan-settlement-666-activate-release.sh \
   deploy/scripts/siyan-settlement-666-postgres-backup.sh \
   deploy/scripts/siyan-settlement-666-preflight.sh \
   deploy/scripts/siyan-settlement-666-restore-drill.sh \
   deploy/scripts/siyan-settlement-666-health-check.sh \
+  deploy/scripts/siyan-settlement-666-reminder-worker-health-check.sh \
   deploy/scripts/siyan-settlement-666-tls-check.sh; do
   [[ -x "${release_dir}/${executable_path}" ]] || die "release script is not executable: ${executable_path}"
 done
@@ -217,6 +240,9 @@ done
   cd -- "${release_dir}"
   sha256sum -c SHA256SUMS >/dev/null
 ) || die "release manifest verification failed"
+"${release_dir}/deploy/scripts/siyan-settlement-666-activate-release.sh" \
+  --validate-units-only --release-dir "${release_dir}" \
+  --installed-unit-dir /etc/systemd/system || die "installed systemd units do not match the release"
 [[ -x "${NODE_BIN}" ]] || die "isolated Node.js executable is unavailable"
 node_real_path="$(readlink -f -- "${NODE_BIN}")" || die "isolated Node.js path cannot be resolved"
 [[ "${node_real_path}" == /opt/siyan-settlement-666/runtime/* ]] \
@@ -232,6 +258,64 @@ read_env_value "${APP_ENV}" REDIS_KEY_PREFIX
 redis_key_prefix="${ENV_VALUE}"
 [[ "${redis_key_prefix}" == "siyan-settlement-666:production:" ]] \
   || die "REDIS_KEY_PREFIX must be the dedicated production namespace"
+read_env_value "${APP_ENV}" RELEASE_ID
+release_id="${ENV_VALUE}"
+[[ "${release_id}" == "${release_dir##*/}" ]] \
+  || die "RELEASE_ID must match the release directory Git SHA"
+read_env_value "${APP_ENV}" SMS_ENABLED
+sms_enabled="${ENV_VALUE}"
+[[ "${sms_enabled}" == "true" || "${sms_enabled}" == "false" ]] \
+  || die "SMS_ENABLED must be true or false"
+read_bounded_integer "${APP_ENV}" SMS_CODE_TTL_SECONDS 60 600
+read_bounded_integer "${APP_ENV}" SMS_RESEND_COOLDOWN_SECONDS 30 600
+read_bounded_integer "${APP_ENV}" SMS_VERIFY_MAX_ATTEMPTS 1 10
+read_bounded_integer "${APP_ENV}" SMS_SEND_RATE_LIMIT_MAX 1 100
+read_bounded_integer "${APP_ENV}" SMS_SEND_RATE_LIMIT_IP_MAX 1 1000
+read_bounded_integer "${APP_ENV}" SMS_SEND_RATE_LIMIT_WINDOW_SECONDS 60 86400
+if [[ "${sms_enabled}" == "true" ]]; then
+  read_env_value "${APP_ENV}" SMS_CODE_HMAC_KEY
+  (( ${#ENV_VALUE} >= 32 )) || die "SMS_CODE_HMAC_KEY must contain at least 32 characters"
+  read_env_value "${APP_ENV}" ALIYUN_SMS_REGION_ID
+  read_env_value "${APP_ENV}" ALIYUN_SMS_ENDPOINT
+  read_env_value "${APP_ENV}" ALIYUN_SMS_SIGN_NAME
+  read_env_value "${APP_ENV}" ALIYUN_SMS_LOGIN_TEMPLATE_CODE
+  [[ "${ENV_VALUE}" =~ ^SMS_[0-9]+$ ]] \
+    || die "ALIYUN_SMS_LOGIN_TEMPLATE_CODE must match the approved SMS template format"
+fi
+read_env_value "${APP_ENV}" NOTIFICATION_PROVIDER
+notification_provider="${ENV_VALUE}"
+[[ "${notification_provider}" == "fake" || "${notification_provider}" == "aliyun" ]] \
+  || die "NOTIFICATION_PROVIDER must be fake or aliyun"
+read_env_value "${APP_ENV}" NOTIFICATION_WORKER_NAME
+notification_worker_name="${ENV_VALUE}"
+[[ "${notification_worker_name}" =~ ^[A-Za-z0-9_.:-]{1,100}$ ]] \
+  || die "NOTIFICATION_WORKER_NAME is invalid"
+read_bounded_integer "${APP_ENV}" NOTIFICATION_POLL_INTERVAL_MS 250 300000
+read_bounded_integer "${APP_ENV}" NOTIFICATION_BATCH_SIZE 1 100
+notification_batch_size=$((10#${ENV_VALUE}))
+read_bounded_integer "${APP_ENV}" NOTIFICATION_LEASE_SECONDS 30 3600
+notification_lease_seconds=$((10#${ENV_VALUE}))
+minimum_notification_lease_seconds=$((notification_batch_size * 15 + 30))
+(( notification_lease_seconds >= minimum_notification_lease_seconds )) \
+  || die "NOTIFICATION_LEASE_SECONDS must cover NOTIFICATION_BATCH_SIZE * 15 seconds plus 30 seconds"
+read_bounded_integer "${APP_ENV}" NOTIFICATION_MAX_ATTEMPTS 1 10
+if [[ "${notification_provider}" == "fake" ]]; then
+  for notification_unit in \
+    siyan-settlement-666-reminder-worker.service \
+    siyan-settlement-666-reminder-worker-health-check.timer; do
+    if systemctl is-active --quiet "${notification_unit}" \
+        || systemctl is-enabled --quiet "${notification_unit}"; then
+      die "fake notification worker and heartbeat timer must remain inactive and disabled in production"
+    fi
+  done
+fi
+if [[ "${notification_provider}" == "aliyun" ]]; then
+  read_env_value "${APP_ENV}" ALIYUN_SMS_SIGN_NAME
+  [[ -n "${ENV_VALUE}" ]] || die "ALIYUN_SMS_SIGN_NAME is required for the notification worker"
+  read_env_value "${APP_ENV}" ALIYUN_SMS_DIGEST_TEMPLATE_CODE
+  [[ "${ENV_VALUE}" =~ ^SMS_[0-9]+$ ]] \
+    || die "ALIYUN_SMS_DIGEST_TEMPLATE_CODE must match the approved SMS template format"
+fi
 read_env_value "${BACKUP_ENV}" DATABASE_URL
 backup_database_url="${ENV_VALUE}"
 read_env_value "${BACKUP_ENV}" BACKUP_REMOTE
@@ -325,7 +409,8 @@ try {
 }
 NODE
 unset app_database_url backup_database_url backup_remote alert_webhook_url \
-  redis_url redis_key_prefix ENV_VALUE
+  redis_url redis_key_prefix release_id sms_enabled notification_provider notification_worker_name \
+  notification_unit ENV_VALUE
 
 role_access_state="$(
   PGDATABASE="$(read_env_value "${BACKUP_ENV}" DATABASE_URL; printf '%s' "${ENV_VALUE}")" \

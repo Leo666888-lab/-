@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomInt } from "node:crypto";
 import { resolve } from "node:path";
 import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
@@ -11,7 +11,10 @@ import type { Database, Queryable } from "./db/types.js";
 import { writeAudit } from "./lib/audit.js";
 import { ApiError } from "./lib/errors.js";
 import { OrderImportFileError, parseOrderImport, type OrderImportMapping } from "./lib/order-import.js";
+import { normalizePhone } from "./lib/phone.js";
 import { hashSessionToken, newId, newSessionToken } from "./lib/security.js";
+import { rescheduleQueuedDailyDigests } from "./notifications/service.js";
+import { SmsProviderError, type SmsProvider } from "./sms/index.js";
 
 const roleSchema = z.enum(["owner", "finance", "sales", "viewer"]);
 type Role = z.infer<typeof roleSchema>;
@@ -33,6 +36,17 @@ interface AuthContext {
   role: Role;
 }
 
+interface LoginUser extends Record<string, unknown> {
+  user_id: string;
+  phone: string;
+  display_name: string;
+  password_hash: string;
+  tenant_id: string;
+  tenant_name: string;
+  tenant_timezone: string;
+  role: string;
+}
+
 interface AppOptions {
   database: Database;
   cache?: Cache;
@@ -43,13 +57,19 @@ interface AppOptions {
   bodyLimitBytes?: number;
   loginRateLimitMax?: number;
   loginRateLimitIpMax?: number;
+  smsProvider?: SmsProvider;
+  smsCodeHmacKey?: string;
+  smsLoginTemplateCode?: string;
+  smsCodeTtlSeconds?: number;
+  smsResendCooldownSeconds?: number;
+  smsVerifyMaxAttempts?: number;
+  smsSendRateLimitMax?: number;
+  smsSendRateLimitIpMax?: number;
+  smsSendRateLimitWindowSeconds?: number;
+  smsResponseMinMs?: number;
   publicOrigin?: string;
   serveStatic?: boolean;
   staticRoot?: string;
-}
-
-function normalizePhone(value: string): string {
-  return value.trim();
 }
 
 function loginRateLimitKey(scope: "ip" | "phone" | "ip-phone", value: string): string {
@@ -57,9 +77,51 @@ function loginRateLimitKey(scope: "ip" | "phone" | "ip-phone", value: string): s
   return `rate-limit:login:${scope}:${digest}`;
 }
 
+function smsRateLimitKey(scope: "ip" | "phone" | "ip-phone", value: string): string {
+  const digest = createHash("sha256").update(`sms:${scope}\0${value}`).digest("hex");
+  return `rate-limit:sms:${scope}:${digest}`;
+}
+
+function smsPhoneKey(phone: string): string {
+  return createHash("sha256").update(`sms:phone\0${phone}`).digest("hex");
+}
+
+function smsCodeDigest(
+  secret: string,
+  challengeId: string,
+  phone: string,
+  tenantId: string | undefined,
+  code: string,
+): string {
+  return createHmac("sha256", secret)
+    .update(`${challengeId}\0${phone}\0${tenantId ?? ""}\0${code}`)
+    .digest("hex");
+}
+
+const phoneSchema = z.string().max(64).transform((value, context) => {
+  const normalized = normalizePhone(value);
+  if (!normalized) {
+    context.addIssue({ code: "custom", message: "手机号格式不正确" });
+    return z.NEVER;
+  }
+  return normalized;
+});
+
 const loginSchema = z.object({
-  phone: z.string().transform(normalizePhone).pipe(z.string().min(5).max(32)),
+  phone: phoneSchema,
   password: z.string().min(6).max(128),
+  tenantId: z.uuid().optional(),
+}).strict();
+
+const requestSmsCodeSchema = z.object({
+  phone: phoneSchema,
+  tenantId: z.uuid().optional(),
+}).strict();
+
+const smsLoginSchema = z.object({
+  phone: phoneSchema,
+  challengeId: z.uuid(),
+  code: z.string().regex(/^\d{6}$/),
   tenantId: z.uuid().optional(),
 }).strict();
 
@@ -181,7 +243,7 @@ const updatePartnerSchema = z.object({
 );
 
 const createMemberSchema = z.object({
-  phone: z.string().transform(normalizePhone).pipe(z.string().min(5).max(32)),
+  phone: phoneSchema,
   displayName: z.string().trim().min(1).max(100),
   role: roleSchema,
 }).strict();
@@ -197,6 +259,16 @@ const updateMemberRoleSchema = z.object({
 
 const updateMemberStatusSchema = z.object({
   active: z.boolean(),
+}).strict();
+
+const notificationSettingsSchema = z.object({
+  enabled: z.boolean(),
+  sendLocalTime: z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/),
+  advanceDays: z.number().int().min(0).max(365),
+  overdueDaily: z.boolean(),
+  receivableEnabled: z.boolean(),
+  payableEnabled: z.boolean(),
+  version: z.number().int().nonnegative(),
 }).strict();
 
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -288,6 +360,57 @@ function dateOnly(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   if (value instanceof Date) return value.toISOString().slice(0, 10);
   return String(value).slice(0, 10);
+}
+
+function maskPhone(phone: string): string {
+  if (/^1[3-9]\d{9}$/.test(phone)) return `${phone.slice(0, 3)}****${phone.slice(-4)}`;
+  const digits = phone.startsWith("+") ? phone.slice(1) : phone;
+  const prefixLength = Math.min(3, Math.max(1, digits.length - 4));
+  return `${phone.startsWith("+") ? "+" : ""}${digits.slice(0, prefixLength)}****${digits.slice(-4)}`;
+}
+
+function localTime(value: unknown): string {
+  return String(value ?? "09:00").slice(0, 5);
+}
+
+function mapNotificationSettings(row: Record<string, unknown>) {
+  return {
+    eligible: true,
+    phoneMasked: maskPhone(String(row.phone)),
+    phoneVerified: row.phone_verified_at !== null && row.phone_verified_at !== undefined,
+    preference: {
+      enabled: row.preference_version === null || row.preference_version === undefined ? false : row.enabled === true,
+      sendLocalTime: localTime(row.send_local_time),
+      advanceDays: Number(row.advance_days ?? 7),
+      overdueDaily: row.overdue_daily === null || row.overdue_daily === undefined ? true : row.overdue_daily === true,
+      receivableEnabled: row.receivable_enabled === null || row.receivable_enabled === undefined
+        ? true
+        : row.receivable_enabled === true,
+      payableEnabled: row.payable_enabled === null || row.payable_enabled === undefined
+        ? true
+        : row.payable_enabled === true,
+      version: Number(row.preference_version ?? 0),
+    },
+  };
+}
+
+async function getNotificationSettings(database: Queryable, auth: AuthContext) {
+  const result = await database.query(
+    `SELECT u.phone, u.phone_verified_at, preference.enabled, preference.send_local_time,
+            preference.advance_days, preference.overdue_daily, preference.receivable_enabled,
+            preference.payable_enabled, preference.version AS preference_version
+     FROM memberships membership
+     JOIN users u ON u.id = membership.user_id AND u.is_active = true
+     LEFT JOIN notification_preferences preference
+       ON preference.tenant_id = membership.tenant_id
+      AND preference.user_id = membership.user_id
+      AND preference.channel = 'sms'
+     WHERE membership.tenant_id = $1 AND membership.user_id = $2 AND membership.is_active = true`,
+    [auth.tenantId, auth.userId],
+  );
+  const row = result.rows[0];
+  if (!row) throw new ApiError(401, "UNAUTHORIZED", "登录已过期，请重新登录");
+  return mapNotificationSettings(row);
 }
 
 function paymentRequestHash(orderId: string, input: z.infer<typeof paymentSchema>): string {
@@ -722,8 +845,9 @@ async function listReminders(database: Queryable, auth: AuthContext) {
       AND reversal.payment_id = pay.id
       AND reversal.order_id = pay.order_id
      WHERE r.tenant_id = $1
+       AND r.due_at <= (((now() AT TIME ZONE $2) + interval '7 days') AT TIME ZONE $2)
        AND (
-         (r.status = 'open' AND r.due_at <= (((now() AT TIME ZONE $2) + interval '7 days') AT TIME ZONE $2))
+         r.status = 'open'
          OR (r.status IN ('acked', 'snoozed') AND r.snoozed_until <= now())
        )
      GROUP BY r.id, o.id, p.name
@@ -770,6 +894,29 @@ export function buildApp(options: AppOptions): FastifyInstance {
   const sessionTtlHours = options.sessionTtlHours ?? 168;
   const loginRateLimitMax = options.loginRateLimitMax ?? 5;
   const loginRateLimitIpMax = options.loginRateLimitIpMax ?? Math.max(20, loginRateLimitMax * 20);
+  const smsProvider = options.smsProvider;
+  const smsCodeHmacKey = options.smsCodeHmacKey;
+  const smsLoginTemplateCode = options.smsLoginTemplateCode;
+  const smsCodeTtlSeconds = options.smsCodeTtlSeconds ?? 300;
+  const smsResendCooldownSeconds = options.smsResendCooldownSeconds ?? 60;
+  const smsVerifyMaxAttempts = options.smsVerifyMaxAttempts ?? 5;
+  const smsSendRateLimitMax = options.smsSendRateLimitMax ?? 5;
+  const smsSendRateLimitIpMax = options.smsSendRateLimitIpMax ?? 20;
+  const smsSendRateLimitWindowSeconds = options.smsSendRateLimitWindowSeconds ?? 3_600;
+  const smsResponseMinMs = options.smsResponseMinMs ?? 250;
+  const pendingSmsDispatches = new Set<Promise<void>>();
+  if (smsProvider && (!smsCodeHmacKey || smsCodeHmacKey.length < 32 || !smsLoginTemplateCode)) {
+    throw new Error("SMS provider requires a login template and an HMAC key of at least 32 characters");
+  }
+
+  const dispatchSms = (operation: () => Promise<void>) => {
+    let tracked: Promise<void>;
+    tracked = Promise.resolve()
+      .then(operation)
+      .catch((error) => app.log.error({ error }, "SMS background dispatch failed"))
+      .finally(() => pendingSmsDispatches.delete(tracked));
+    pendingSmsDispatches.add(tracked);
+  };
 
   void app.register(cookie);
   void app.register(helmet, {
@@ -801,7 +948,9 @@ export function buildApp(options: AppOptions): FastifyInstance {
     const rawPhone = typeof request.body === "object" && request.body !== null && "phone" in request.body
       ? (request.body as { phone?: unknown }).phone
       : undefined;
-    const phone = typeof rawPhone === "string" ? normalizePhone(rawPhone).slice(0, 64) : "";
+    const phone = typeof rawPhone === "string"
+      ? (normalizePhone(rawPhone) ?? rawPhone.normalize("NFKC").trim().slice(0, 64))
+      : "";
     const rules: FixedWindowRule[] = [{
       key: loginRateLimitKey("ip", request.ip),
       limit: loginRateLimitIpMax,
@@ -826,6 +975,48 @@ export function buildApp(options: AppOptions): FastifyInstance {
       reply.header("Retry-After", Math.max(1, attempt.retryAfterSeconds));
       throw new ApiError(429, "LOGIN_RATE_LIMITED", "登录尝试过于频繁，请稍后再试");
     }
+  };
+
+  const issueSession = async (
+    reply: FastifyReply,
+    resolveUser: (tx: Queryable) => Promise<LoginUser>,
+    method: "password" | "sms",
+  ) => {
+    const token = newSessionToken();
+    const sessionId = newId();
+    const expiresAt = new Date(Date.now() + sessionTtlHours * 3_600_000);
+    const user = await database.transaction(async (tx) => {
+      const lockedUser = await resolveUser(tx);
+      await tx.query(
+        `INSERT INTO sessions (id, tenant_id, user_id, token_hash, expires_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [sessionId, lockedUser.tenant_id, lockedUser.user_id, hashSessionToken(token), expiresAt.toISOString()],
+      );
+      await writeAudit(tx, {
+        tenantId: lockedUser.tenant_id,
+        actorUserId: lockedUser.user_id,
+        action: "auth.login",
+        entityType: "session",
+        entityId: sessionId,
+        metadata: method === "sms" ? { method } : undefined,
+      });
+      return lockedUser;
+    });
+    reply.setCookie(SESSION_COOKIE_NAME, token, {
+      path: "/",
+      httpOnly: true,
+      sameSite: "strict",
+      secure: isProduction,
+      maxAge: sessionTtlHours * 3_600,
+    });
+    reply.header("Cache-Control", "no-store");
+    return reply.send({
+      token,
+      expiresAt: expiresAt.toISOString(),
+      user: { id: user.user_id, phone: user.phone, displayName: user.display_name },
+      tenant: { id: user.tenant_id, name: user.tenant_name, timezone: user.tenant_timezone },
+      role: roleSchema.parse(user.role),
+    });
   };
 
   app.setErrorHandler((error, _request, reply) => {
@@ -857,24 +1048,103 @@ export function buildApp(options: AppOptions): FastifyInstance {
     return { status: "ok", time: new Date().toISOString() };
   });
 
+  app.post("/api/auth/sms-codes", async (request, reply) => {
+    if (!smsProvider || !smsCodeHmacKey || !smsLoginTemplateCode) {
+      throw new ApiError(503, "SMS_UNAVAILABLE", "短信登录暂不可用");
+    }
+    const responseStartedAt = Date.now();
+    const input = parse(requestSmsCodeSchema, request.body);
+    const phoneKey = smsPhoneKey(input.phone);
+    const cooldownKey = `sms:cooldown:login:${phoneKey}`;
+    const rateRules: FixedWindowRule[] = [
+      { key: smsRateLimitKey("ip", request.ip), limit: smsSendRateLimitIpMax },
+      { key: smsRateLimitKey("phone", input.phone), limit: smsSendRateLimitMax },
+      { key: smsRateLimitKey("ip-phone", `${request.ip}\0${input.phone}`), limit: smsSendRateLimitMax },
+    ];
+
+    let sendLimit: FixedWindowResult;
+    let acquiredCooldown = false;
+    try {
+      sendLimit = await cache.consumeFixedWindow(rateRules, smsSendRateLimitWindowSeconds);
+      if (sendLimit.allowed) {
+        acquiredCooldown = await cache.setIfAbsent(cooldownKey, "1", smsResendCooldownSeconds);
+      }
+    } catch {
+      reply.header("Retry-After", "1");
+      throw new ApiError(503, "SMS_VERIFICATION_UNAVAILABLE", "短信验证服务暂不可用，请稍后再试");
+    }
+    reply.header("X-RateLimit-Limit", smsSendRateLimitMax);
+    reply.header("X-RateLimit-Remaining", sendLimit.remaining);
+    if (!sendLimit.allowed) {
+      reply.header("Retry-After", Math.max(1, sendLimit.retryAfterSeconds));
+      throw new ApiError(429, "SMS_CODE_RATE_LIMITED", "验证码发送过于频繁，请稍后再试");
+    }
+    if (!acquiredCooldown) {
+      reply.header("Retry-After", smsResendCooldownSeconds);
+      throw new ApiError(429, "SMS_CODE_RATE_LIMITED", "验证码发送过于频繁，请稍后再试");
+    }
+
+    const challengeId = newId();
+    const challengeKey = `sms:challenge:login:${challengeId}`;
+    const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    const digest = smsCodeDigest(smsCodeHmacKey, challengeId, input.phone, input.tenantId, code);
+    try {
+      await cache.set(challengeKey, digest, smsCodeTtlSeconds);
+    } catch {
+      await cache.delete(cooldownKey).catch(() => undefined);
+      reply.header("Retry-After", "1");
+      throw new ApiError(503, "SMS_VERIFICATION_UNAVAILABLE", "短信验证服务暂不可用，请稍后再试");
+    }
+
+    const recipient = await database.query<{ id: string }>(
+      `SELECT u.id
+       FROM users u
+       JOIN memberships m ON m.user_id = u.id AND m.is_active = true
+       WHERE u.phone = $1 AND u.is_active = true
+         AND ($2::uuid IS NULL OR m.tenant_id = $2::uuid)
+       LIMIT 1`,
+      [input.phone, input.tenantId ?? null],
+    );
+    const hasRecipient = Boolean(recipient.rowCount);
+    dispatchSms(async () => {
+      if (!hasRecipient) {
+        await cache.delete(challengeKey).catch(() => undefined);
+        return;
+      }
+      try {
+        await smsProvider.sendSms({
+          phone: input.phone,
+          templateCode: smsLoginTemplateCode,
+          params: { code },
+          outId: challengeId,
+        });
+      } catch (error) {
+        await cache.delete(challengeKey).catch(() => undefined);
+        const providerCode = error instanceof SmsProviderError ? error.providerCode : "UNEXPECTED_ERROR";
+        request.log.error({ smsProvider: smsProvider.name, providerCode }, "SMS verification send failed");
+      }
+    });
+
+    if (smsResponseMinMs > 0) {
+      const targetDurationMs = smsResponseMinMs + randomInt(0, 51);
+      const remainingMs = targetDurationMs - (Date.now() - responseStartedAt);
+      if (remainingMs > 0) await new Promise((resolve) => setTimeout(resolve, remainingMs));
+    }
+
+    return reply.status(202).send({
+      accepted: true,
+      challengeId,
+      expiresInSeconds: smsCodeTtlSeconds,
+      retryAfterSeconds: smsResendCooldownSeconds,
+    });
+  });
+
   app.post("/api/auth/login", {
     preHandler: enforceLoginRateLimit,
   }, async (request, reply) => {
     const input = parse(loginSchema, request.body);
-    const token = newSessionToken();
-    const sessionId = newId();
-    const expiresAt = new Date(Date.now() + sessionTtlHours * 3_600_000);
-    const user = await database.transaction(async (tx) => {
-      const result = await tx.query<{
-      user_id: string;
-      phone: string;
-      display_name: string;
-      password_hash: string;
-      tenant_id: string;
-      tenant_name: string;
-      tenant_timezone: string;
-      role: string;
-      }>(
+    return issueSession(reply, async (tx) => {
+      const result = await tx.query<LoginUser>(
         `SELECT u.id AS user_id, u.phone, u.display_name, u.password_hash,
                 m.tenant_id, t.name AS tenant_name, t.timezone AS tenant_timezone, m.role
          FROM users u
@@ -891,35 +1161,62 @@ export function buildApp(options: AppOptions): FastifyInstance {
       if (!lockedUser || !(await bcrypt.compare(input.password, lockedUser.password_hash))) {
         throw new ApiError(401, "INVALID_CREDENTIALS", "手机号或密码错误");
       }
-      await tx.query(
-        `INSERT INTO sessions (id, tenant_id, user_id, token_hash, expires_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [sessionId, lockedUser.tenant_id, lockedUser.user_id, hashSessionToken(token), expiresAt.toISOString()],
-      );
-      await writeAudit(tx, {
-        tenantId: lockedUser.tenant_id,
-        actorUserId: lockedUser.user_id,
-        action: "auth.login",
-        entityType: "session",
-        entityId: sessionId,
-      });
       return lockedUser;
-    });
-    reply.setCookie(SESSION_COOKIE_NAME, token, {
-      path: "/",
-      httpOnly: true,
-      sameSite: "strict",
-      secure: isProduction,
-      maxAge: sessionTtlHours * 3_600,
-    });
-    reply.header("Cache-Control", "no-store");
-    return reply.send({
-      token,
-      expiresAt: expiresAt.toISOString(),
-      user: { id: user.user_id, phone: user.phone, displayName: user.display_name },
-      tenant: { id: user.tenant_id, name: user.tenant_name, timezone: user.tenant_timezone },
-      role: roleSchema.parse(user.role),
-    });
+    }, "password");
+  });
+
+  app.post("/api/auth/sms-login", {
+    preHandler: enforceLoginRateLimit,
+  }, async (request, reply) => {
+    if (!smsProvider || !smsCodeHmacKey || !smsLoginTemplateCode) {
+      throw new ApiError(503, "SMS_UNAVAILABLE", "短信登录暂不可用");
+    }
+    const input = parse(smsLoginSchema, request.body);
+    const expectedDigest = smsCodeDigest(
+      smsCodeHmacKey,
+      input.challengeId,
+      input.phone,
+      input.tenantId,
+      input.code,
+    );
+    let consumed;
+    try {
+      consumed = await cache.consumeOneTimeValue(
+        `sms:challenge:login:${input.challengeId}`,
+        expectedDigest,
+        smsVerifyMaxAttempts,
+      );
+    } catch {
+      reply.header("Retry-After", "1");
+      throw new ApiError(503, "SMS_VERIFICATION_UNAVAILABLE", "短信验证服务暂不可用，请稍后再试");
+    }
+    if (consumed.status !== "consumed") {
+      throw new ApiError(401, "INVALID_SMS_CODE", "验证码错误或已过期");
+    }
+
+    return issueSession(reply, async (tx) => {
+      const result = await tx.query<LoginUser>(
+        `SELECT u.id AS user_id, u.phone, u.display_name, u.password_hash,
+                m.tenant_id, t.name AS tenant_name, t.timezone AS tenant_timezone, m.role
+         FROM users u
+         JOIN memberships m ON m.user_id = u.id AND m.is_active = true
+         JOIN tenants t ON t.id = m.tenant_id
+         WHERE u.phone = $1 AND u.is_active = true
+           AND ($2::uuid IS NULL OR m.tenant_id = $2::uuid)
+         ORDER BY m.created_at
+         LIMIT 1
+         FOR UPDATE OF u`,
+        [input.phone, input.tenantId ?? null],
+      );
+      const lockedUser = result.rows[0];
+      if (!lockedUser) throw new ApiError(401, "INVALID_SMS_CODE", "验证码错误或已过期");
+      await tx.query(
+        `UPDATE users SET phone_verified_at = now(), updated_at = now()
+         WHERE id = $1`,
+        [lockedUser.user_id],
+      );
+      return lockedUser;
+    }, "sms");
   });
 
   app.post("/api/auth/accept-invitation", async (request, reply) => {
@@ -1070,6 +1367,167 @@ export function buildApp(options: AppOptions): FastifyInstance {
     });
     reply.header("Cache-Control", "no-store");
     return reply.send({ success: true, revokedSessions });
+  });
+
+  app.get("/api/notification-settings/me", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance"]);
+    return getNotificationSettings(database, auth);
+  });
+
+  app.put("/api/notification-settings/me", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance"]);
+    const input = parse(notificationSettingsSchema, request.body);
+    const preference = await database.transaction(async (tx) => {
+      const memberResult = await tx.query<{
+        phone: string;
+        phone_verified_at: Date | string | null;
+        role: string;
+      }>(
+        `SELECT u.phone, u.phone_verified_at, membership.role
+         FROM memberships membership
+         JOIN users u ON u.id = membership.user_id AND u.is_active = true
+         WHERE membership.tenant_id = $1 AND membership.user_id = $2 AND membership.is_active = true
+         FOR UPDATE OF membership, u`,
+        [auth.tenantId, auth.userId],
+      );
+      const member = memberResult.rows[0];
+      if (!member) throw new ApiError(401, "UNAUTHORIZED", "登录已过期，请重新登录");
+      if (!["owner", "finance"].includes(roleSchema.parse(member.role))) {
+        throw new ApiError(403, "FORBIDDEN", "当前角色没有此操作权限");
+      }
+
+      const currentResult = await tx.query<{ version: number; enabled: boolean }>(
+        `SELECT version, enabled
+         FROM notification_preferences
+         WHERE tenant_id = $1 AND user_id = $2 AND channel = 'sms'
+         FOR UPDATE`,
+        [auth.tenantId, auth.userId],
+      );
+      const current = currentResult.rows[0];
+      const currentVersion = Number(current?.version ?? 0);
+      if (currentVersion !== input.version) {
+        throw new ApiError(
+          409,
+          "NOTIFICATION_SETTINGS_VERSION_CONFLICT",
+          "提醒设置已在其他页面修改，请刷新后重试",
+          { currentVersion },
+        );
+      }
+      if (input.enabled && !member.phone_verified_at) {
+        throw new ApiError(409, "PHONE_NOT_VERIFIED", "请先通过短信验证当前手机号");
+      }
+
+      if (input.enabled) {
+        const destinationHash = createHash("sha256").update(member.phone).digest("hex");
+        await tx.query(
+          `UPDATE notification_endpoints
+           SET disabled_at = now(), updated_at = now()
+           WHERE tenant_id = $1 AND user_id = $2 AND channel = 'sms'
+             AND destination_hash <> $3 AND disabled_at IS NULL`,
+          [auth.tenantId, auth.userId, destinationHash],
+        );
+        await tx.query(
+          `INSERT INTO notification_endpoints (
+             id, tenant_id, user_id, channel, destination, destination_hash,
+             destination_hint, verified_at, consented_at
+           ) VALUES ($1, $2, $3, 'sms', $4, $5, $6, $7, now())
+           ON CONFLICT (tenant_id, user_id, channel, destination_hash) DO UPDATE
+           SET destination = EXCLUDED.destination,
+               destination_hint = EXCLUDED.destination_hint,
+               verified_at = EXCLUDED.verified_at,
+               consented_at = now(),
+               disabled_at = NULL,
+               updated_at = now()`,
+          [
+            newId(),
+            auth.tenantId,
+            auth.userId,
+            member.phone,
+            destinationHash,
+            maskPhone(member.phone),
+            member.phone_verified_at,
+          ],
+        );
+      }
+
+      const nextVersion = currentVersion + 1;
+      if (current) {
+        const updated = await tx.query(
+          `UPDATE notification_preferences
+           SET enabled = $4, send_local_time = $5::time, advance_days = $6,
+               overdue_daily = $7, receivable_enabled = $8, payable_enabled = $9,
+               version = version + 1, updated_at = now()
+           WHERE tenant_id = $1 AND user_id = $2 AND channel = 'sms' AND version = $3
+           RETURNING version`,
+          [
+            auth.tenantId,
+            auth.userId,
+            input.version,
+            input.enabled,
+            input.sendLocalTime,
+            input.advanceDays,
+            input.overdueDaily,
+            input.receivableEnabled,
+            input.payableEnabled,
+          ],
+        );
+        if (!updated.rowCount) {
+          throw new ApiError(409, "NOTIFICATION_SETTINGS_VERSION_CONFLICT", "提醒设置已在其他页面修改，请刷新后重试");
+        }
+      } else {
+        const inserted = await tx.query(
+          `INSERT INTO notification_preferences (
+             tenant_id, user_id, channel, enabled, send_local_time, advance_days,
+             overdue_daily, receivable_enabled, payable_enabled, version
+           ) VALUES ($1, $2, 'sms', $3, $4::time, $5, $6, $7, $8, 1)
+           ON CONFLICT (tenant_id, user_id, channel) DO NOTHING
+           RETURNING version`,
+          [
+            auth.tenantId,
+            auth.userId,
+            input.enabled,
+            input.sendLocalTime,
+            input.advanceDays,
+            input.overdueDaily,
+            input.receivableEnabled,
+            input.payableEnabled,
+          ],
+        );
+        if (!inserted.rowCount) {
+          throw new ApiError(409, "NOTIFICATION_SETTINGS_VERSION_CONFLICT", "提醒设置已在其他页面修改，请刷新后重试");
+        }
+      }
+
+      const rescheduledOutboxCount = await rescheduleQueuedDailyDigests(tx, {
+        tenantId: auth.tenantId,
+        userId: auth.userId,
+        sendLocalTime: input.sendLocalTime,
+      });
+
+      await writeAudit(tx, {
+        tenantId: auth.tenantId,
+        actorUserId: auth.userId,
+        action: "notification.settings_updated",
+        entityType: "notification_preference",
+        entityId: auth.userId,
+        metadata: {
+          fromVersion: currentVersion,
+          toVersion: nextVersion,
+          previousEnabled: current?.enabled ?? false,
+          enabled: input.enabled,
+          sendLocalTime: input.sendLocalTime,
+          advanceDays: input.advanceDays,
+          overdueDaily: input.overdueDaily,
+          receivableEnabled: input.receivableEnabled,
+          payableEnabled: input.payableEnabled,
+          rescheduledOutboxCount,
+        },
+      });
+      return getNotificationSettings(tx, auth);
+    });
+    return preference;
   });
 
   app.get("/api/members", async (request) => {
@@ -2013,7 +2471,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
         if (totalCents === paidCents) {
           await tx.query(
             `UPDATE reminders
-             SET status = 'closed', closed_at = now(), updated_at = now()
+             SET status = 'closed', closed_at = now(), version = version + 1, updated_at = now()
              WHERE tenant_id = $1 AND order_id = $2 AND status IN ('open', 'acked', 'snoozed')`,
             [auth.tenantId, params.id],
           );
@@ -2028,11 +2486,21 @@ export function buildApp(options: AppOptions): FastifyInstance {
             });
           }
         } else if (activeReminders.rowCount) {
-          await tx.query(
-            `UPDATE reminders SET due_at = $3, updated_at = now()
-             WHERE tenant_id = $1 AND order_id = $2 AND status IN ('open', 'acked', 'snoozed')`,
-            [auth.tenantId, params.id, dueAt],
-          );
+          if (changedFields.includes("dueAt")) {
+            await tx.query(
+              `UPDATE reminders
+               SET due_at = $3, status = 'open', snoozed_until = NULL,
+                   acknowledged_at = NULL, version = version + 1, updated_at = now()
+               WHERE tenant_id = $1 AND order_id = $2 AND status IN ('open', 'acked', 'snoozed')`,
+              [auth.tenantId, params.id, dueAt],
+            );
+          } else {
+            await tx.query(
+              `UPDATE reminders SET version = version + 1, updated_at = now()
+               WHERE tenant_id = $1 AND order_id = $2 AND status IN ('open', 'acked', 'snoozed')`,
+              [auth.tenantId, params.id],
+            );
+          }
         } else {
           const reminderId = newId();
           await tx.query(
@@ -2258,7 +2726,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
       if (remainingCents === 0) {
         const closedReminders = await tx.query<{ id: string }>(
           `UPDATE reminders
-           SET status = 'closed', closed_at = now(), updated_at = now()
+           SET status = 'closed', closed_at = now(), version = version + 1, updated_at = now()
            WHERE tenant_id = $1 AND order_id = $2 AND status IN ('open', 'snoozed', 'acked')
            RETURNING id`,
           [auth.tenantId, params.id],
@@ -2477,7 +2945,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
         `UPDATE reminders
          SET status = 'acked', acknowledged_at = now(),
              snoozed_until = ((((now() AT TIME ZONE $3)::date + 1) + time '09:00') AT TIME ZONE $3),
-             updated_at = now()
+             version = version + 1, updated_at = now()
          WHERE tenant_id = $1 AND id = $2
          RETURNING snoozed_until`,
         [auth.tenantId, params.id, auth.tenantTimezone],
@@ -2511,7 +2979,8 @@ export function buildApp(options: AppOptions): FastifyInstance {
       if (!reminder) throw new ApiError(404, "NOT_FOUND", "提醒不存在");
       if (reminder.status === "closed") throw new ApiError(409, "REMINDER_CLOSED", "已结清提醒不能暂缓");
       await tx.query(
-        `UPDATE reminders SET status = 'snoozed', snoozed_until = $3, updated_at = now()
+        `UPDATE reminders
+         SET status = 'snoozed', snoozed_until = $3, version = version + 1, updated_at = now()
          WHERE tenant_id = $1 AND id = $2`,
         [auth.tenantId, params.id, until.toISOString()],
       );
@@ -2573,9 +3042,11 @@ export function buildApp(options: AppOptions): FastifyInstance {
     });
   }
 
-  if (options.closeDatabase) {
-    app.addHook("onClose", async () => database.close());
-  }
+  app.addHook("onClose", async () => {
+    await Promise.allSettled([...pendingSmsDispatches]);
+  });
+
+  if (options.closeDatabase) app.addHook("onClose", async () => database.close());
 
   return app;
 }

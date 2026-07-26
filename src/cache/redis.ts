@@ -1,6 +1,12 @@
 import { createClient, type RedisClientType } from "redis";
-import type { Cache, CacheReadiness, FixedWindowResult, FixedWindowRule } from "./types.js";
-import { validateCacheEntry, validateFixedWindow } from "./types.js";
+import type {
+  Cache,
+  CacheReadiness,
+  FixedWindowResult,
+  FixedWindowRule,
+  OneTimeValueResult,
+} from "./types.js";
+import { validateCacheEntry, validateFixedWindow, validateOneTimeValue } from "./types.js";
 
 const FIXED_WINDOW_SCRIPT = `
 local window_seconds = tonumber(ARGV[1])
@@ -33,6 +39,42 @@ for index, key in ipairs(KEYS) do
 end
 
 return { allowed, remaining, retry_after }
+`;
+
+const CONSUME_ONE_TIME_VALUE_SCRIPT = `
+local stored = redis.call("GET", KEYS[1])
+if not stored then
+  return { 0, 0 }
+end
+
+local value = stored
+local attempts = 0
+local decoded_ok, state = pcall(cjson.decode, stored)
+if decoded_ok and type(state) == "table" and state.__one_time == 1 then
+  value = tostring(state.value or "")
+  attempts = tonumber(state.attempts) or 0
+end
+
+local max_attempts = tonumber(ARGV[2])
+if value == ARGV[1] then
+  redis.call("DEL", KEYS[1])
+  return { 1, math.max(0, max_attempts - attempts) }
+end
+
+attempts = attempts + 1
+local remaining = math.max(0, max_attempts - attempts)
+if remaining == 0 then
+  redis.call("DEL", KEYS[1])
+  return { -2, 0 }
+end
+
+local ttl = redis.call("TTL", KEYS[1])
+if ttl <= 0 then
+  redis.call("DEL", KEYS[1])
+  return { 0, 0 }
+end
+redis.call("SET", KEYS[1], cjson.encode({ __one_time = 1, value = value, attempts = attempts }), "EX", ttl)
+return { -1, remaining }
 `;
 
 export class RedisCache implements Cache {
@@ -94,6 +136,31 @@ export class RedisCache implements Cache {
       remaining: result[1] as number,
       retryAfterSeconds: result[2] as number,
     };
+  }
+
+  async consumeOneTimeValue(
+    key: string,
+    expectedValue: string,
+    maxAttempts: number,
+  ): Promise<OneTimeValueResult> {
+    validateOneTimeValue(key, expectedValue, maxAttempts);
+    const result = await this.client.withCommandOptions({
+      abortSignal: AbortSignal.timeout(this.commandTimeoutMs),
+    }).eval(CONSUME_ONE_TIME_VALUE_SCRIPT, {
+      keys: [key],
+      arguments: [expectedValue, String(maxAttempts)],
+    });
+    if (!Array.isArray(result) || result.length !== 2 || result.some((value) => typeof value !== "number")) {
+      throw new Error("Redis one-time value response was invalid");
+    }
+    const status = result[0] === 1
+      ? "consumed"
+      : result[0] === -1
+        ? "mismatch"
+        : result[0] === -2
+          ? "exhausted"
+          : "missing";
+    return { status, remainingAttempts: result[1] as number };
   }
 
   async readiness(): Promise<CacheReadiness> {

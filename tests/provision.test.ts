@@ -19,6 +19,12 @@ describe("owner provisioning", () => {
       PROVISION_OWNER_NAME: "Owner",
       PROVISION_OWNER_PASSWORD: "a-secure-password-2026",
     } as NodeJS.ProcessEnv)).toThrow(/timezone/);
+    expect(parseProvisionOwnerEnv({
+      PROVISION_TENANT_NAME: "New tenant",
+      PROVISION_OWNER_PHONE: "+86 138 0000 9999",
+      PROVISION_OWNER_NAME: "Owner",
+      PROVISION_OWNER_PASSWORD: "a-secure-password-2026",
+    } as NodeJS.ProcessEnv).ownerPhone).toBe("13800009999");
   });
 
   it("creates one owner with a bcrypt hash, membership, and audit record", async () => {
@@ -29,7 +35,7 @@ describe("owner provisioning", () => {
       const result = await provisionOwner(database, {
         tenantName: "Provisioned Trade Co",
         tenantTimezone: "Asia/Shanghai",
-        ownerPhone: "13800009999",
+        ownerPhone: "+86 138 0000 9999",
         ownerName: "Initial Owner",
         ownerPassword: password,
       });

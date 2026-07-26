@@ -29,23 +29,37 @@
           <img class="brand-mark small" src="./assets/siyan-mark.png" width="32" height="32" alt="" />
           <div><strong id="loginHeadingTitle">欢迎回来</strong><span id="loginHeadingSubtitle">登录你的企业账本</span></div>
         </div>
-        <div class="auth-tabs" aria-label="登录方式">
-          <span class="auth-tab active">密码登录</span>
-          <span id="smsLoginTag" class="integration-tag">短信登录待接入</span>
+        <div id="authTabs" class="auth-tabs" role="tablist" aria-label="登录方式">
+          <button id="passwordLoginTab" class="auth-tab active" type="button" role="tab" aria-selected="true" aria-controls="loginForm">密码登录</button>
+          <button id="smsLoginTab" class="auth-tab" type="button" role="tab" aria-selected="false" aria-controls="smsLoginForm" tabindex="-1">短信验证码</button>
         </div>
-        <form id="loginForm" class="login-form">
+        <form id="loginForm" class="login-form" role="tabpanel" aria-labelledby="passwordLoginTab">
           <label>手机号<input id="loginPhone" type="tel" inputmode="tel" autocomplete="username" required /></label>
           <label>密码<input id="loginPassword" type="password" autocomplete="current-password" required /></label>
-          <p id="loginError" class="form-error hidden"></p>
+          <p id="loginError" class="form-error hidden" role="alert" aria-live="assertive"></p>
           <div class="login-options"><span class="security-note"><i data-lucide="shield-check"></i>安全会话，不在浏览器长期保存密码或令牌</span><button class="text-button" type="button" data-action="fill-test-account">填入本地测试账号</button></div>
           <button id="loginSubmit" class="primary-button wide" type="submit"><i data-lucide="arrow-right"></i>进入结算台</button>
+        </form>
+        <form id="smsLoginForm" class="login-form hidden" role="tabpanel" aria-labelledby="smsLoginTab">
+          <label>手机号<input id="smsLoginPhone" type="tel" inputmode="tel" autocomplete="username" required /></label>
+          <div class="sms-code-field">
+            <label for="smsLoginCode">短信验证码</label>
+            <div class="sms-code-row">
+              <input id="smsLoginCode" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" aria-describedby="smsCodeStatus" required />
+              <button id="smsCodeSend" class="outline-button sms-code-button" type="button" aria-describedby="smsCodeStatus">获取验证码</button>
+            </div>
+            <p id="smsCodeStatus" class="sms-code-status" role="status" aria-live="polite">验证码将发送至当前手机号</p>
+          </div>
+          <p id="smsLoginError" class="form-error hidden" role="alert" aria-live="assertive"></p>
+          <div class="login-options"><span class="security-note"><i data-lucide="shield-check"></i>验证码仅用于本次登录，请勿转发给他人</span></div>
+          <button id="smsLoginSubmit" class="primary-button wide" type="submit"><i data-lucide="message-square-lock"></i>验证码登录</button>
         </form>
         <form id="invitationForm" class="login-form hidden">
           <input id="invitationToken" type="hidden" />
           <div class="invitation-intro"><i data-lucide="user-check"></i><div><strong>接受企业邀请</strong><span>设置密码后即可加入企业账本</span></div></div>
           <label>设置密码<input id="invitationPassword" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /><span class="field-hint">至少 12 位，请勿与其他网站共用</span></label>
           <label>确认密码<input id="invitationPasswordConfirm" type="password" minlength="12" maxlength="128" autocomplete="new-password" required /></label>
-          <p id="invitationError" class="form-error hidden"></p>
+          <p id="invitationError" class="form-error hidden" role="alert" aria-live="assertive"></p>
           <button id="invitationSubmit" class="primary-button wide" type="submit"><i data-lucide="user-check"></i>接受邀请并设置密码</button>
         </form>
         <p id="loginNote" class="login-note">测试账号仅适用于本地种子数据，生产环境必须关闭测试数据。</p>

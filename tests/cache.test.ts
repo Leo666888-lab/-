@@ -3,12 +3,14 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   createCache,
+  MemoryCache,
   NoopCache,
   registerDependencyReadiness,
   type Cache,
   type CacheReadiness,
   type FixedWindowResult,
   type FixedWindowRule,
+  type OneTimeValueResult,
 } from "../src/cache/index.js";
 
 class ReadinessCache implements Cache {
@@ -19,6 +21,9 @@ class ReadinessCache implements Cache {
   async delete(): Promise<boolean> { return false; }
   async consumeFixedWindow(): Promise<FixedWindowResult> {
     return { allowed: true, remaining: 1, retryAfterSeconds: 0 };
+  }
+  async consumeOneTimeValue(): Promise<OneTimeValueResult> {
+    return { status: "missing", remainingAttempts: 0 };
   }
   async readiness(): Promise<CacheReadiness> { return this.state; }
   async close(): Promise<void> {}
@@ -44,6 +49,37 @@ describe("cache infrastructure", () => {
     ]);
     expect(attempts.map((attempt) => attempt.allowed)).toEqual([true, true, false]);
     expect(attempts[2]).toMatchObject({ remaining: 0, retryAfterSeconds: 60 });
+  });
+
+  it("atomically validates, limits, expires, and consumes in-memory one-time values", async () => {
+    let now = 1_000;
+    const cache = new MemoryCache(() => now);
+    await cache.set("verification:first", "expected", 60);
+    expect(await cache.consumeOneTimeValue("verification:first", "wrong", 2)).toEqual({
+      status: "mismatch",
+      remainingAttempts: 1,
+    });
+    expect(await cache.consumeOneTimeValue("verification:first", "expected", 2)).toEqual({
+      status: "consumed",
+      remainingAttempts: 1,
+    });
+    expect(await cache.consumeOneTimeValue("verification:first", "expected", 2)).toEqual({
+      status: "missing",
+      remainingAttempts: 0,
+    });
+
+    await cache.set("verification:concurrent", "value", 60);
+    const concurrent = await Promise.all([
+      cache.consumeOneTimeValue("verification:concurrent", "value", 3),
+      cache.consumeOneTimeValue("verification:concurrent", "value", 3),
+    ]);
+    expect(concurrent.map((result) => result.status).sort()).toEqual(["consumed", "missing"]);
+
+    await cache.set("verification:exhausted", "value", 60);
+    expect((await cache.consumeOneTimeValue("verification:exhausted", "wrong", 1)).status).toBe("exhausted");
+    await cache.set("verification:expired", "value", 1);
+    now += 1_001;
+    expect((await cache.consumeOneTimeValue("verification:expired", "value", 3)).status).toBe("missing");
   });
 
   it("rejects an unavailable Redis dependency without disclosing its URL", async () => {
@@ -119,10 +155,19 @@ it.skipIf(!process.env.TEST_REDIS_URL)("shares atomic limits across real Redis c
     ]);
     expect(attempts.filter((attempt) => attempt.allowed)).toHaveLength(1);
     expect(attempts.filter((attempt) => !attempt.allowed)).toHaveLength(1);
+
+    await first.set("one-time", "expected", 60);
+    const consumed = await Promise.all([
+      first.consumeOneTimeValue("one-time", "expected", 3),
+      second.consumeOneTimeValue("one-time", "expected", 3),
+    ]);
+    expect(consumed.filter((result) => result.status === "consumed")).toHaveLength(1);
+    expect(consumed.filter((result) => result.status === "missing")).toHaveLength(1);
   } finally {
     await Promise.allSettled([
       first.delete("namespace"),
       first.delete("fixed-window"),
+      first.delete("one-time"),
       isolated.delete("namespace"),
     ]);
     await Promise.allSettled([first.close(), second.close(), isolated.close()]);

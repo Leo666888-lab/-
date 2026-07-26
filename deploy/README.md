@@ -8,6 +8,8 @@
 | 资源 | 固定值 |
 | --- | --- |
 | 应用服务 | `siyan-settlement-666.service` |
+| 提醒 worker | `siyan-settlement-666-reminder-worker.service`（真实通知验收前保持 disabled） |
+| worker 心跳检查 | `siyan-settlement-666-reminder-worker-health-check.timer` |
 | 备份服务 | `siyan-settlement-666-postgres-backup.service` |
 | 备份定时器 | `siyan-settlement-666-postgres-backup.timer` |
 | 健康检查 | `siyan-settlement-666-health-check.timer` |
@@ -31,7 +33,7 @@
 | --- | --- | --- |
 | ECS 应用服务器 | 4 vCPU、8 GiB，80 GiB ESSD 系统盘 | 只运行应用、Nginx 和运维任务；单台 ECS 仍是单点，流量或 SLA 提升后改为 SLB + 至少 2 台 ECS |
 | RDS PostgreSQL | PostgreSQL 16 高可用版，2 vCPU、4 GiB、100 GiB ESSD | 开启存储自动扩容、SSL、自动备份和日志备份；应用与备份使用不同账号 |
-| Tair（Redis OSS 兼容） | Redis 7 兼容版本、标准主从高可用、2 GiB | 开启 TLS、ACL 应用账号、持久化和自动备份；只保存验证码、会话、任务锁等可过期数据，不作为账务事实库 |
+| Tair（Redis OSS 兼容） | Redis 7 兼容版本、标准主从高可用、2 GiB | 开启 TLS 和 ACL 应用账号；当前只保存验证码、发送冷却和登录限流等可过期数据，不作为账务事实库 |
 
 容量告警建议从 CPU 70%、内存 70%、RDS 存储 70%、连接数 70% 开始；连续运行一段时间后按监控
 实测调整。所有实例启用云监控告警。RDS 是订单和收付款的唯一事实库，Redis 故障只能造成临时
@@ -53,7 +55,8 @@
 RDS 至少启用每日自动备份、日志备份/时间点恢复并保留 30 天；开启删除保护，任何恢复必须落到
 新实例验证，不能覆盖生产实例。本仓库的 `pg_dump` + `age` + 独立 OSS 对象锁备份仍然必须运行，
 因为同账号内的 RDS 自动备份不能替代异地、不可变副本。Tair 启用 AOF/持久化和每日自动备份，
-保留至少 7 天；所有验证码、会话和任务锁必须设置 TTL，恢复后允许由数据库状态重建。
+保留至少 7 天；所有验证码、发送冷却和限流计数都必须设置 TTL。会话、通知 outbox、发送租约和
+去重状态保存在 PostgreSQL，不依赖 Tair 恢复。
 
 证书使用服务器现有文件：
 
@@ -164,6 +167,7 @@ release_staging="$(sudo mktemp -d "/opt/siyan-settlement-666/releases/.incoming-
 sudo tar --no-same-owner --no-same-permissions -xzf "${archive}" -C "${release_staging}"
 sudo /usr/bin/bash -c 'cd "$1" && sha256sum -c SHA256SUMS' _ "${release_staging}"
 sudo test -f "${release_staging}/dist/src/server.js"
+sudo test -f "${release_staging}/dist/src/worker.js"
 sudo test -f "${release_staging}/dist/src/cli/migrate.js"
 sudo test -f "${release_staging}/public/index.html"
 sudo test -d "${release_staging}/node_modules/fastify"
@@ -185,7 +189,7 @@ sudo mv "${release_staging}" "${release_dir}"
 NODE_ENV=production
 HOST=127.0.0.1
 PORT=16666
-DATABASE_URL=postgresql://APP_USER:URL_ENCODED_PASSWORD@DB_HOST:5432/APP_DB
+DATABASE_URL=postgresql://APP_USER:URL_ENCODED_PASSWORD@DB_HOST:5432/APP_DB?sslmode=require&connect_timeout=5
 REDIS_URL=rediss://ACL_USER:URL_ENCODED_PASSWORD@TAIR_PRIVATE_HOST:6379/0
 REDIS_KEY_PREFIX=siyan-settlement-666:production:
 SEED_DEMO=false
@@ -193,16 +197,56 @@ PUBLIC_ORIGIN=https://123.56.254.236:666
 SESSION_TTL_HOURS=168
 BODY_LIMIT_BYTES=1048576
 LOGIN_RATE_LIMIT_MAX=5
+SMS_ENABLED=false
+SMS_CODE_TTL_SECONDS=300
+SMS_RESEND_COOLDOWN_SECONDS=60
+SMS_VERIFY_MAX_ATTEMPTS=5
+SMS_SEND_RATE_LIMIT_MAX=5
+SMS_SEND_RATE_LIMIT_IP_MAX=20
+SMS_SEND_RATE_LIMIT_WINDOW_SECONDS=3600
+NOTIFICATION_PROVIDER=fake
+NOTIFICATION_WORKER_NAME=settlement-reminders
+NOTIFICATION_POLL_INTERVAL_MS=30000
+NOTIFICATION_BATCH_SIZE=5
+NOTIFICATION_LEASE_SECONDS=120
+NOTIFICATION_MAX_ATTEMPTS=5
+ALIYUN_SMS_DIGEST_TEMPLATE_CODE=SMS_已审核每日摘要模板编号
+RELEASE_ID=当前发布目录的40位Git提交SHA
 ```
 
 数据库和 Redis 密码必须 URL 编码。生产环境不得省略 `DATABASE_URL`、`REDIS_URL` 或
-`REDIS_KEY_PREFIX`，不得启用 demo seed。RDS 地址必须是私网地址并启用 SSL；可在 PostgreSQL URL
-中追加 `?sslmode=require&connect_timeout=5`。Redis 只接受 `rediss://`，必须使用独立 ACL 用户、
+`REDIS_KEY_PREFIX`，不得启用 demo seed。RDS 地址必须是私网地址，PostgreSQL URL 必须包含唯一的
+`sslmode=require`、`verify-ca` 或 `verify-full`；建议同时设置 `connect_timeout=5`。Redis 只接受
+`rediss://`，必须使用独立 ACL 用户、
 至少 16 字符的强密码和固定前缀 `siyan-settlement-666:production:`；不要复用默认管理员账号。
 ACL 键空间只允许该前缀，命令至少允许 `PING`、`GET`、`SET`、`DEL`、`EVAL`、`INCR`、`EXPIRE`
 和 `TTL`，并拒绝 `FLUSHALL`、`FLUSHDB`、`CONFIG`、`KEYS`、`SHUTDOWN` 等管理或全库命令。
 preflight 使用应用系统用户执行带 SNI 的 TLS/ACL `PING`，密码仅通过 `REDISCLI_AUTH` 子进程环境
 传递，不会把完整 URL 或密码放进进程参数或日志。
+
+真实短信登录开通后，把 `SMS_ENABLED` 改为 `true`，并在同一受限文件中增加以下配置。这里的 HMAC
+密钥由密码库生成，至少 32 字符；不能复用数据库、Redis 或阿里云账号密码：
+
+```text
+SMS_CODE_HMAC_KEY=由密码库生成的独立随机密钥
+ALIYUN_SMS_REGION_ID=短信服务实际地域
+ALIYUN_SMS_ENDPOINT=短信服务实际Endpoint
+ALIYUN_SMS_SIGN_NAME=已审核通过的短信签名
+ALIYUN_SMS_LOGIN_TEMPLATE_CODE=SMS_已审核模板编号
+```
+
+应用通过 ECS RAM 角色和阿里云默认凭据链调用短信服务，`app.env` 不允许出现长期
+`AccessKeyId`/`AccessKeySecret`。RAM 角色只授予当前短信签名和模板所需的发送权限。`SMS_ENABLED=true`
+前必须完成真实号码发送、错误号码、频率限制、验证码过期、重复使用、Tair 故障和费用告警验收。
+
+`NOTIFICATION_PROVIDER=fake` 只用于开发和结构验收，生产 worker 会拒绝启动；preflight 也会阻止
+fake worker 或其心跳 timer 被启用。阿里云适配器已经实现，但签名、每日摘要模板、MNS 回执消费者
+和真实回执尚未完成验收，因此仍须保持 worker service 与心跳 timer disabled/inactive。每次发布前
+都要把 `RELEASE_ID` 更新为目标
+release 的 40 位 Git SHA，preflight 会核对它与发布目录一致。
+Worker 当前串行发送短信；`NOTIFICATION_LEASE_SECONDS` 必须至少覆盖
+`NOTIFICATION_BATCH_SIZE * 15 秒 + 30 秒`。示例的 5 条批量和 120 秒租约已经保留余量，扩大批量时
+必须同步增大租约，否则 Worker 会拒绝启动。
 主服务启动命令还会强制覆盖 `NODE_ENV`、`HOST`、`PORT`、`SEED_DEMO` 和 `PUBLIC_ORIGIN`，
 即使环境文件误填，应用也只能以 production 模式监听 `127.0.0.1:16666`，并只接受来自
 `https://123.56.254.236:666` 的浏览器 Cookie 写请求。
@@ -235,7 +279,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE APP_USER IN SCHEMA public
 `root:siyan-settlement-666-backup`、`0640`，不得复制应用数据库凭据：
 
 ```text
-DATABASE_URL=postgresql://siyan_settlement_backup:DIFFERENT_URL_ENCODED_PASSWORD@DB_HOST:5432/APP_DB
+DATABASE_URL=postgresql://siyan_settlement_backup:DIFFERENT_URL_ENCODED_PASSWORD@DB_HOST:5432/APP_DB?sslmode=require&connect_timeout=5
 BACKUP_RETENTION_DAYS=30
 BACKUP_REMOTE=offsite:siyan-settlement-666/production
 ```
@@ -254,7 +298,7 @@ TLS_RENEWAL_TIMER=certbot-ip-renew.timer
 ```
 
 不得把上述任何文件提交到 Git。部署前检查会验证三份文件各自的变量白名单、重复键和 Unix
-读取边界，并拒绝应用与备份数据库用户名或密码相同的配置。
+读取边界，并拒绝未要求 PostgreSQL SSL 或应用与备份数据库用户名/密码相同的配置。
 
 ## 加密备份密钥
 
@@ -282,10 +326,18 @@ age-keygen -y siyan-settlement-666-backup.agekey
 
 ## 安装服务
 
-确认隔离 Node 路径、`/usr/bin/bash` 和部署目录均正确后安装独立 unit：
+确认隔离 Node 路径、`/usr/bin/bash` 和部署目录均正确后，从目标 release 同步独立 unit。不要从
+checkout 的其他提交安装 unit；发布脚本会在迁移前逐字节比较 release 与 `/etc/systemd/system`，并拒绝
+缺失、多余、篡改的项目 unit 以及 unit drop-in：
 
 ```bash
-sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
+release_id=完整的40位Git提交SHA
+release_dir="/opt/siyan-settlement-666/releases/${release_id}"
+sudo install -m 0644 "${release_dir}"/deploy/systemd/*.service \
+  "${release_dir}"/deploy/systemd/*.timer /etc/systemd/system/
+sudo "${release_dir}/deploy/scripts/siyan-settlement-666-activate-release.sh" \
+  --validate-units-only --release-dir "${release_dir}" \
+  --installed-unit-dir /etc/systemd/system
 sudo systemd-analyze verify /etc/systemd/system/siyan-settlement-666*.service \
   /etc/systemd/system/siyan-settlement-666*.timer
 sudo systemctl daemon-reload
@@ -363,12 +415,14 @@ sudo "${release_dir}/deploy/scripts/siyan-settlement-666-preflight.sh" \
   --mode upgrade --release-dir "${release_dir}"
 ```
 
-preflight 只执行摘要、权限、systemd、Nginx、证书、端口、只读 PostgreSQL 查询、Redis TLS/ACL
-`PING`、健康检查和备份新鲜度检查，不执行迁移、不创建或删除数据库，也不启动或停止服务。
+preflight 只执行摘要、权限、systemd、Nginx、证书、端口、短信/worker 配置约束、只读 PostgreSQL
+查询、Redis TLS/ACL `PING`、健康检查和备份新鲜度检查，不执行迁移、不创建或删除数据库，也不
+启动或停止服务。
 
 然后通过一次性 transient unit 对尚未切换的 release 执行迁移。systemd 读取生产环境文件，
 `/usr/bin/env` 再强制覆盖所有非秘密运行模式变量，因此不会误回退到本地 PGlite。迁移本身持有
-advisory lock，但仍不得让多个发布流程同时进行：
+advisory lock，但仍不得让多个发布流程同时进行。生产 Web service 明确不会在启动时自动迁移；如果
+迁移 CLI 未成功完成，激活脚本不会切换 release：
 
 ```bash
 release_id=完整的40位Git提交SHA
@@ -386,69 +440,34 @@ sudo systemd-run --unit=siyan-settlement-666-migrate --wait --collect --pipe \
   "${release_dir}/dist/src/cli/migrate.js"
 ```
 
-迁移成功后，记录上一版本，用同目录中的临时符号链接原子切换 `current`。健康检查最多等待
-30 秒；若新版本失败，立即切回上一版本。首次部署失败时停止服务并保留失败版本供排查：
+迁移成功后使用经过 checksum、systemd unit 和进程工作目录校验的激活脚本。脚本取得排他锁，停止
+切换期间可能运行旧代码的 Worker，原子切换 `current`，重启应用，并在 Worker 原先启用或运行时同步
+重启 Worker 与心跳 timer：
 
 ```bash
-set -Eeuo pipefail
 release_id=完整的40位Git提交SHA
 release_dir="/opt/siyan-settlement-666/releases/${release_id}"
-current_link="/opt/siyan-settlement-666/current"
-[[ ! -e "${current_link}" || -L "${current_link}" ]] || {
-  echo "current 必须不存在或为符号链接" >&2
-  exit 1
-}
-previous_release="$(readlink -f /opt/siyan-settlement-666/current 2>/dev/null || true)"
-if [[ -n "${previous_release}" && "${previous_release}" != /opt/siyan-settlement-666/releases/* ]]; then
-  echo "拒绝切换：上一版本不在独立 releases 目录" >&2
-  exit 1
-fi
-next_link="/opt/siyan-settlement-666/.current-${release_id}.$$"
-sudo ln -s "${release_dir}" "${next_link}"
-sudo mv -Tf "${next_link}" "${current_link}"
-sudo systemctl enable siyan-settlement-666.service
-sudo systemctl restart siyan-settlement-666.service
-
-healthy=false
-for _attempt in $(seq 1 30); do
-  if curl --fail --silent --show-error http://127.0.0.1:16666/api/health >/dev/null; then
-    healthy=true
-    break
-  fi
-  sleep 1
-done
-
-if [[ "${healthy}" != true ]]; then
-  sudo journalctl -u siyan-settlement-666.service -n 100 --no-pager
-  if [[ -n "${previous_release}" && -d "${previous_release}" ]]; then
-    rollback_link="/opt/siyan-settlement-666/.rollback-${release_id}.$$"
-    sudo ln -s "${previous_release}" "${rollback_link}"
-    sudo mv -Tf "${rollback_link}" "${current_link}"
-    sudo systemctl restart siyan-settlement-666.service
-    curl --fail --retry 20 --retry-all-errors --retry-delay 1 \
-      http://127.0.0.1:16666/api/health >/dev/null
-  else
-    sudo systemctl stop siyan-settlement-666.service
-    sudo rm -f -- "${current_link}"
-  fi
-  exit 1
-fi
+sudo "${release_dir}/deploy/scripts/siyan-settlement-666-activate-release.sh" \
+  --release-dir "${release_dir}"
 ```
 
-上线后若需人工回滚，指定经过校验且与当前数据库兼容的旧 release ID，再执行相同的原子切换和
-健康检查。不能把任意路径传给回滚命令：
+如果切换后健康检查失败，脚本会停止应用和提醒服务、保留新的 `current` 并返回失败；不会把旧代码自动切回数据库已经迁移过的结构。此时必须先收集 journal 和发布 SHA，再做前向修复，或由负责人按
+备份/PITR 记录协调数据库恢复后，人工选择与恢复后 schema 兼容的旧代码。只有证明 schema 兼容时才
+允许人工回滚，不能把任意路径传给回滚命令：
 
 ```bash
 rollback_release_id=需要回滚到的40位Git提交SHA
 [[ "${rollback_release_id}" =~ ^[0-9a-f]{40}$ ]]
 rollback_release="/opt/siyan-settlement-666/releases/${rollback_release_id}"
-sudo test -r "${rollback_release}/dist/src/server.js"
-rollback_link="/opt/siyan-settlement-666/.rollback-${rollback_release_id}.$$"
-sudo ln -s "${rollback_release}" "${rollback_link}"
-sudo mv -Tf "${rollback_link}" /opt/siyan-settlement-666/current
-sudo systemctl restart siyan-settlement-666.service
-curl --fail --retry 30 --retry-all-errors --retry-delay 1 \
-  http://127.0.0.1:16666/api/health >/dev/null
+sudo test -d "${rollback_release}" -a -r "${rollback_release}/SHA256SUMS"
+sudo /usr/bin/bash -c 'cd "$1" && sha256sum -c SHA256SUMS' _ "${rollback_release}"
+sudo install -m 0644 "${rollback_release}"/deploy/systemd/*.service \
+  "${rollback_release}"/deploy/systemd/*.timer /etc/systemd/system/
+sudo "${rollback_release}/deploy/scripts/siyan-settlement-666-activate-release.sh" \
+  --validate-units-only --release-dir "${rollback_release}" \
+  --installed-unit-dir /etc/systemd/system
+sudo "${rollback_release}/deploy/scripts/siyan-settlement-666-activate-release.sh" \
+  --release-dir "${rollback_release}"
 ```
 
 ## 启用监控、TLS 检查和备份
@@ -500,6 +519,38 @@ systemctl list-timers 'siyan-settlement-666-*'
 健康检查每分钟运行。TLS 检查每天运行并要求证书至少还有 14 天有效期、续期证据未过期、续期
 定时器处于 active/enabled，且线上指纹与磁盘一致。备份每天 `02:30 Asia/Shanghai` 运行并随机延迟
 最多 15 分钟。任一 service 失败都会调用告警模板；告警自身带 15 分钟默认冷却，避免持续故障刷屏。
+
+## 提醒 worker 启用门槛
+
+仓库包含独立 worker unit 和每分钟心跳检查，但这不代表真实提醒已经开通。只有以下条件全部具备
+真实证据后才能启用：
+
+- 发布包中的阿里云通知适配器测试通过，短信签名和每日结算提醒模板均审核通过；
+- worker 使用 ECS RAM 角色，不在环境文件、Git、日志或进程参数中保存长期 AccessKey；
+- `009_notification_delivery.sql` 已成功迁移，目标发送人已验证手机号并明确同意接收提醒；
+- 重复调度、进程中断、超时、供应商不确定响应和 RDS 短暂故障均不会导致重复通知；
+- MNS 回执消费者已经实现并通过鉴权、幂等和重放测试；
+- 测试租户完成一次真实“生成提醒 → worker 发送 → 阿里云回执 → 持久回执记录”闭环；
+- 失败 unit 告警、短信余额和日发送量告警均真实到达负责人。
+
+完成后先人工启动和检查，不要直接批量启用：
+
+```bash
+sudo systemctl start siyan-settlement-666-reminder-worker.service
+sudo systemctl start siyan-settlement-666-reminder-worker-health-check.service
+sudo journalctl -u siyan-settlement-666-reminder-worker.service -n 100 --no-pager
+sudo journalctl -u siyan-settlement-666-reminder-worker-health-check.service -n 50 --no-pager
+```
+
+确认当前 release 的非 fake 心跳通过且真实收件无重复后，才执行：
+
+```bash
+sudo systemctl enable siyan-settlement-666-reminder-worker.service
+sudo systemctl enable --now siyan-settlement-666-reminder-worker-health-check.timer
+```
+
+回滚或紧急停发时先禁用 worker 和心跳 timer，不要删除 outbox 或发送记录；保留数据库状态供人工
+核对后再恢复。
 
 ## 隔离恢复演练
 

@@ -185,6 +185,19 @@ describe("controlled order corrections", () => {
     expect(belowPaid.statusCode).toBe(409);
     expect(belowPaid.json().error.code).toBe("TOTAL_BELOW_PAID");
 
+    const reminderBeforeCorrection = await database.query<{ id: string; version: number }>(
+      "SELECT id, version FROM reminders WHERE tenant_id = $1 AND order_id = $2 AND status <> 'closed'",
+      [DEMO_IDS.tenant, order.id],
+    );
+    const reminderId = reminderBeforeCorrection.rows[0]!.id;
+    const reminderVersion = Number(reminderBeforeCorrection.rows[0]!.version);
+    const acknowledged = await app.inject({
+      method: "POST",
+      url: `/api/reminders/${reminderId}/ack`,
+      headers: auth(ownerToken),
+    });
+    expect(acknowledged.statusCode).toBe(200);
+
     const corrected = await app.inject({
       method: "PATCH",
       url: `/api/orders/${order.id}`,
@@ -202,12 +215,25 @@ describe("controlled order corrections", () => {
     expect(order.outstandingCents).toBe(10_000);
     expect(order.corrections).toHaveLength(2);
 
-    const reminder = await database.query<{ due_at: Date | string }>(
-      "SELECT due_at FROM reminders WHERE tenant_id = $1 AND order_id = $2 AND status <> 'closed'",
+    const reminder = await database.query<{
+      due_at: Date | string;
+      status: string;
+      snoozed_until: Date | string | null;
+      acknowledged_at: Date | string | null;
+      version: number;
+    }>(
+      `SELECT due_at, status, snoozed_until, acknowledged_at, version
+       FROM reminders WHERE tenant_id = $1 AND order_id = $2 AND status <> 'closed'`,
       [DEMO_IDS.tenant, order.id],
     );
     expect(reminder.rowCount).toBe(1);
     expect(new Date(reminder.rows[0]!.due_at).toISOString()).toBe(order.dueAt);
+    expect(reminder.rows[0]).toMatchObject({
+      status: "open",
+      snoozed_until: null,
+      acknowledged_at: null,
+    });
+    expect(Number(reminder.rows[0]!.version)).toBeGreaterThan(reminderVersion);
   });
 
   it("reopens a settled reminder when a correction increases the total and closes it at equality", async () => {

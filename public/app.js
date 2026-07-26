@@ -53,9 +53,21 @@ const state = {
   members: [],
   membersStatus: "idle",
   membersError: "",
+  notificationSettings: null,
+  notificationPreferenceDraft: null,
+  notificationSettingsStatus: "idle",
+  notificationSettingsError: "",
+  notificationSettingsSaveStatus: "idle",
+  notificationSettingsSaveError: "",
   invitationUrl: "",
   invitationExpiresAt: "",
   invitationToken: "",
+  authMode: "password",
+  smsChallengeId: "",
+  smsChallengePhone: "",
+  smsCountdownEndsAt: 0,
+  smsCountdownTimer: 0,
+  smsRequestPending: false,
   editingOrderId: "",
   editingOrderVersion: 0,
   detailOrderId: "",
@@ -85,12 +97,13 @@ const paymentMethodLabels = {
 };
 
 class ApiClientError extends Error {
-  constructor(status, code, message, details) {
+  constructor(status, code, message, details, retryAfterSeconds = 0) {
     super(message || "请求失败，请稍后重试");
     this.name = "ApiClientError";
     this.status = status;
     this.code = code;
     this.details = details;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -123,6 +136,14 @@ function setSyncing(active, message = "正在同步") {
   byId("refreshButton")?.classList.toggle("is-spinning", state.pendingRequests > 0);
 }
 
+function retryAfterSeconds(response) {
+  const value = response.headers.get("retry-after");
+  if (!value) return 0;
+  if (/^\d+$/.test(value.trim())) return Math.max(0, Number(value.trim()));
+  const retryAt = Date.parse(value);
+  return Number.isFinite(retryAt) ? Math.max(0, Math.ceil((retryAt - Date.now()) / 1000)) : 0;
+}
+
 async function apiRequest(path, { method = "GET", body, headers = {}, auth = true, busyText = "正在同步" } = {}) {
   setSyncing(true, busyText);
   try {
@@ -142,7 +163,8 @@ async function apiRequest(path, { method = "GET", body, headers = {}, auth = tru
         response.status,
         payload?.error?.code,
         payload?.error?.message || `请求失败（${response.status}）`,
-        payload?.error?.details
+        payload?.error?.details,
+        retryAfterSeconds(response)
       );
     }
     return payload ?? {};
@@ -152,6 +174,65 @@ async function apiRequest(path, { method = "GET", body, headers = {}, auth = tru
   } finally {
     setSyncing(false);
   }
+}
+
+function setFormError(element, message = "") {
+  element.textContent = message;
+  element.classList.toggle("hidden", !message);
+}
+
+function updateSmsCountdown() {
+  const button = byId("smsCodeSend");
+  const remaining = Math.max(0, Math.ceil((state.smsCountdownEndsAt - Date.now()) / 1000));
+  button.disabled = state.smsRequestPending || remaining > 0;
+  button.textContent = remaining > 0 ? `${remaining} 秒后重发` : "获取验证码";
+  if (remaining === 0 && state.smsCountdownTimer) {
+    window.clearInterval(state.smsCountdownTimer);
+    state.smsCountdownTimer = 0;
+  }
+}
+
+function startSmsCountdown(seconds) {
+  if (state.smsCountdownTimer) window.clearInterval(state.smsCountdownTimer);
+  const duration = Math.max(1, Math.min(3600, Math.ceil(Number(seconds) || 60)));
+  state.smsCountdownEndsAt = Date.now() + duration * 1000;
+  updateSmsCountdown();
+  state.smsCountdownTimer = window.setInterval(updateSmsCountdown, 250);
+}
+
+function resetSmsChallenge(statusMessage = "验证码将发送至当前手机号") {
+  if (state.smsCountdownTimer) window.clearInterval(state.smsCountdownTimer);
+  state.smsCountdownTimer = 0;
+  state.smsCountdownEndsAt = 0;
+  state.smsChallengeId = "";
+  state.smsChallengePhone = "";
+  state.smsRequestPending = false;
+  byId("smsLoginCode").value = "";
+  byId("smsCodeSend").removeAttribute("aria-busy");
+  const status = byId("smsCodeStatus");
+  status.textContent = statusMessage;
+  delete status.dataset.kind;
+  updateSmsCountdown();
+}
+
+function setAuthMode(mode, { focus = true } = {}) {
+  const smsMode = mode === "sms";
+  state.authMode = smsMode ? "sms" : "password";
+  const passwordPhone = byId("loginPhone");
+  const smsPhone = byId("smsLoginPhone");
+  if (smsMode && passwordPhone.value.trim()) smsPhone.value = passwordPhone.value.trim();
+  if (!smsMode && smsPhone.value.trim()) passwordPhone.value = smsPhone.value.trim();
+
+  byId("loginForm").classList.toggle("hidden", smsMode);
+  byId("smsLoginForm").classList.toggle("hidden", !smsMode);
+  for (const [tabId, active] of [["passwordLoginTab", !smsMode], ["smsLoginTab", smsMode]]) {
+    const tab = byId(tabId);
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
+  }
+  setFormError(smsMode ? byId("smsLoginError") : byId("loginError"));
+  if (focus) window.requestAnimationFrame(() => (smsMode ? smsPhone : passwordPhone).focus());
 }
 
 function showLogin(errorMessage = "") {
@@ -176,6 +257,12 @@ function showLogin(errorMessage = "") {
   state.members = [];
   state.membersStatus = "idle";
   state.membersError = "";
+  state.notificationSettings = null;
+  state.notificationPreferenceDraft = null;
+  state.notificationSettingsStatus = "idle";
+  state.notificationSettingsError = "";
+  state.notificationSettingsSaveStatus = "idle";
+  state.notificationSettingsSaveError = "";
   state.invitationUrl = "";
   state.invitationExpiresAt = "";
   state.invitationToken = "";
@@ -185,16 +272,14 @@ function showLogin(errorMessage = "") {
   byId("view-ocr")?.replaceChildren();
   byId("appShell").classList.add("hidden");
   byId("loginScreen").classList.remove("hidden");
-  byId("loginForm").classList.remove("hidden");
   byId("invitationForm").classList.add("hidden");
-  byId("smsLoginTag").classList.remove("hidden");
+  byId("authTabs").classList.remove("hidden");
   byId("loginNote").classList.remove("hidden");
   byId("loginHeadingTitle").textContent = "欢迎回来";
   byId("loginHeadingSubtitle").textContent = "登录你的企业账本";
-  document.querySelector(".auth-tab").textContent = "密码登录";
-  const error = byId("loginError");
-  error.textContent = errorMessage;
-  error.classList.toggle("hidden", !errorMessage);
+  resetSmsChallenge();
+  setAuthMode("password", { focus: false });
+  setFormError(byId("loginError"), errorMessage);
   byId("loginSubmit").disabled = false;
 }
 
@@ -203,19 +288,21 @@ function showInvitationAcceptance(token) {
   byId("appShell").classList.add("hidden");
   byId("loginScreen").classList.remove("hidden");
   byId("loginForm").classList.add("hidden");
+  byId("smsLoginForm").classList.add("hidden");
   byId("invitationForm").classList.remove("hidden");
-  byId("smsLoginTag").classList.add("hidden");
+  byId("authTabs").classList.add("hidden");
   byId("loginNote").classList.add("hidden");
+  resetSmsChallenge();
   byId("invitationToken").value = token;
   byId("invitationError").textContent = "";
   byId("invitationError").classList.add("hidden");
   byId("loginHeadingTitle").textContent = "加入企业账本";
   byId("loginHeadingSubtitle").textContent = "验证邀请并设置你的登录密码";
-  document.querySelector(".auth-tab").textContent = "成员邀请";
   refreshIcons();
 }
 
 function showApplication() {
+  resetSmsChallenge();
   byId("loginScreen").classList.add("hidden");
   byId("appShell").classList.remove("hidden");
 }
@@ -239,6 +326,18 @@ async function loadBootstrap({ announce = false } = {}) {
   if (announce) showToast("数据已刷新");
 }
 
+async function completeLogin(loginPayload) {
+  const fallbackToken = typeof loginPayload.token === "string" ? loginPayload.token : null;
+  state.token = null;
+  try {
+    await loadBootstrap();
+  } catch (cookieError) {
+    if (cookieError.status !== 401 || !fallbackToken) throw cookieError;
+    state.token = fallbackToken;
+    await loadBootstrap();
+  }
+}
+
 async function initializeSession() {
   state.token = null;
   try {
@@ -253,9 +352,9 @@ async function login(event) {
   event.preventDefault();
   const submit = byId("loginSubmit");
   const errorElement = byId("loginError");
-  errorElement.classList.add("hidden");
-  errorElement.textContent = "";
+  setFormError(errorElement);
   submit.disabled = true;
+  submit.setAttribute("aria-busy", "true");
   try {
     const loginPayload = await apiRequest("/api/auth/login", {
       method: "POST",
@@ -266,22 +365,98 @@ async function login(event) {
         password: byId("loginPassword").value
       }
     });
-
-    const fallbackToken = typeof loginPayload.token === "string" ? loginPayload.token : null;
-    state.token = null;
-    try {
-      await loadBootstrap();
-    } catch (cookieError) {
-      if (cookieError.status !== 401 || !fallbackToken) throw cookieError;
-      state.token = fallbackToken;
-      await loadBootstrap();
-    }
+    await completeLogin(loginPayload);
     byId("loginPassword").value = "";
     showToast("登录成功");
   } catch (error) {
-    showLogin(error.message);
+    setFormError(errorElement, error.message);
   } finally {
     submit.disabled = false;
+    submit.removeAttribute("aria-busy");
+  }
+}
+
+async function requestSmsCode() {
+  const phoneInput = byId("smsLoginPhone");
+  const sendButton = byId("smsCodeSend");
+  const errorElement = byId("smsLoginError");
+  const statusElement = byId("smsCodeStatus");
+  setFormError(errorElement);
+  if (!phoneInput.reportValidity()) return;
+
+  state.smsRequestPending = true;
+  phoneInput.disabled = true;
+  sendButton.setAttribute("aria-busy", "true");
+  updateSmsCountdown();
+  try {
+    const phone = phoneInput.value.trim();
+    const payload = await apiRequest("/api/auth/sms-codes", {
+      method: "POST",
+      auth: false,
+      busyText: "正在发送验证码",
+      body: { phone }
+    });
+    if (typeof payload.challengeId !== "string" || !payload.challengeId) {
+      throw new ApiClientError(502, "INVALID_SMS_RESPONSE", "验证码服务响应无效，请稍后再试");
+    }
+    state.smsChallengeId = payload.challengeId;
+    state.smsChallengePhone = phone;
+    const expiresInSeconds = Math.max(1, Number(payload.expiresInSeconds) || 300);
+    const expiryText = expiresInSeconds < 60
+      ? `${Math.ceil(expiresInSeconds)} 秒`
+      : `${Math.ceil(expiresInSeconds / 60)} 分钟`;
+    statusElement.textContent = `验证码已发送，${expiryText}内有效`;
+    statusElement.dataset.kind = "success";
+    startSmsCountdown(payload.retryAfterSeconds);
+    if (state.authMode === "sms") byId("smsLoginCode").focus();
+  } catch (error) {
+    if (error.status === 429 && error.retryAfterSeconds > 0) startSmsCountdown(error.retryAfterSeconds);
+    setFormError(errorElement, error.message);
+  } finally {
+    state.smsRequestPending = false;
+    phoneInput.disabled = false;
+    sendButton.removeAttribute("aria-busy");
+    updateSmsCountdown();
+  }
+}
+
+async function loginWithSms(event) {
+  event.preventDefault();
+  const submit = byId("smsLoginSubmit");
+  const errorElement = byId("smsLoginError");
+  const phone = byId("smsLoginPhone").value.trim();
+  setFormError(errorElement);
+  if (!state.smsChallengeId || phone !== state.smsChallengePhone) {
+    setFormError(errorElement, "请先为当前手机号获取验证码");
+    byId("smsCodeSend").focus();
+    return;
+  }
+
+  submit.disabled = true;
+  submit.setAttribute("aria-busy", "true");
+  try {
+    const loginPayload = await apiRequest("/api/auth/sms-login", {
+      method: "POST",
+      auth: false,
+      busyText: "正在验证并登录",
+      body: {
+        phone,
+        challengeId: state.smsChallengeId,
+        code: byId("smsLoginCode").value.trim()
+      }
+    });
+    await completeLogin(loginPayload);
+    resetSmsChallenge();
+    showToast("登录成功");
+  } catch (error) {
+    setFormError(errorElement, error.message);
+    if (error.code === "INVALID_SMS_CODE") {
+      byId("smsLoginCode").focus();
+      byId("smsLoginCode").select();
+    }
+  } finally {
+    submit.disabled = false;
+    submit.removeAttribute("aria-busy");
   }
 }
 
@@ -1104,11 +1279,214 @@ function handleLocalFile(file, purpose) {
   reader.readAsDataURL(file);
 }
 
+function defaultNotificationPreference() {
+  return {
+    enabled: false,
+    sendLocalTime: "09:00",
+    advanceDays: 7,
+    overdueDaily: true,
+    receivableEnabled: true,
+    payableEnabled: true,
+    version: 0
+  };
+}
+
+function safeMaskedPhone(value) {
+  const text = typeof value === "string" ? value.trim().slice(0, 40) : "";
+  if (!text) return "未绑定手机号";
+  const digitCount = (text.match(/\d/g) || []).length;
+  return digitCount >= 7 && /^\+?[\d\s()-]+$/.test(text) ? "已绑定手机号" : text;
+}
+
+function normalizeNotificationSettings(payload) {
+  const defaults = defaultNotificationPreference();
+  const preference = payload?.preference || {};
+  const sendLocalTime = typeof preference.sendLocalTime === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(preference.sendLocalTime)
+    ? preference.sendLocalTime
+    : defaults.sendLocalTime;
+  const advanceDays = Number.isInteger(preference.advanceDays) && preference.advanceDays >= 0 && preference.advanceDays <= 365
+    ? preference.advanceDays
+    : defaults.advanceDays;
+  const version = Number.isInteger(preference.version) && preference.version >= 0 ? preference.version : defaults.version;
+  return {
+    eligible: payload?.eligible === true,
+    phoneMasked: safeMaskedPhone(payload?.phoneMasked),
+    phoneVerified: payload?.phoneVerified === true,
+    preference: {
+      enabled: preference.enabled === true,
+      sendLocalTime,
+      advanceDays,
+      overdueDaily: preference.overdueDaily !== false,
+      receivableEnabled: preference.receivableEnabled !== false,
+      payableEnabled: preference.payableEnabled !== false,
+      version
+    }
+  };
+}
+
+function notificationPreferenceDraft(preference) {
+  return { ...preference, advanceDays: String(preference.advanceDays) };
+}
+
+function canManageNotificationSettings() {
+  return state.data && (state.data.role === "owner" || state.data.role === "finance");
+}
+
+function notificationSettingsPanelMarkup() {
+  if (!canManageNotificationSettings()) return "";
+  if (state.notificationSettingsStatus === "idle" || state.notificationSettingsStatus === "loading") {
+    return `<section class="notification-settings-panel" aria-labelledby="notificationSettingsTitle"><div class="panel-header"><div><h2 id="notificationSettingsTitle">结算提醒</h2><span>每天汇总待结算与逾期订单</span></div></div><div class="notification-settings-state" role="status">${icon("loader-circle", 22)}<span>正在读取提醒设置</span></div></section>`;
+  }
+  if (state.notificationSettingsStatus === "error" || !state.notificationSettings) {
+    return `<section class="notification-settings-panel" aria-labelledby="notificationSettingsTitle"><div class="panel-header"><div><h2 id="notificationSettingsTitle">结算提醒</h2><span>每天汇总待结算与逾期订单</span></div></div><div class="notification-settings-state error" role="alert">${icon("circle-alert", 22)}<span>${escapeHtml(state.notificationSettingsError || "提醒设置读取失败")}</span><button class="outline-button small-button" type="button" data-action="refresh-notification-settings">重试</button></div></section>`;
+  }
+
+  const settings = state.notificationSettings;
+  const draft = state.notificationPreferenceDraft || notificationPreferenceDraft(settings.preference);
+  const saving = state.notificationSettingsSaveStatus === "saving";
+  const enabled = settings.phoneVerified && draft.enabled === true;
+  const enableDisabled = saving || !settings.eligible || !settings.phoneVerified;
+  const feedbackMessage = saving
+    ? "正在保存提醒设置"
+    : state.notificationSettingsSaveStatus === "success"
+      ? "提醒设置已保存"
+      : state.notificationSettingsSaveStatus === "error"
+        ? state.notificationSettingsSaveError || "提醒设置保存失败"
+        : "";
+  const feedbackRole = state.notificationSettingsSaveStatus === "error" ? "alert" : "status";
+  const verificationNote = settings.phoneVerified
+    ? `<div id="notificationVerificationNote" class="notification-verification verified">${icon("badge-check", 17)}<div><strong>接收号码已验证</strong><span dir="auto">${escapeHtml(settings.phoneMasked)}</span></div></div>`
+    : `<div id="notificationVerificationNote" class="notification-verification warning" role="status">${icon("message-square-warning", 17)}<div><strong>手机号尚未验证</strong><span dir="auto">${escapeHtml(settings.phoneMasked)}</span><small>请先通过短信验证码登录完成验证，再开启提醒。</small></div></div>`;
+
+  if (!settings.eligible) {
+    return `<section class="notification-settings-panel" aria-labelledby="notificationSettingsTitle"><div class="panel-header"><div><h2 id="notificationSettingsTitle">结算提醒</h2><span>每天汇总待结算与逾期订单</span></div><span class="status-badge draft">暂不可用</span></div><div class="notification-settings-body">${verificationNote}<div class="notification-settings-state"><span>当前账号尚不具备短信提醒配置条件。</span></div></div></section>`;
+  }
+
+  return `<section class="notification-settings-panel" aria-labelledby="notificationSettingsTitle">
+    <div class="panel-header"><div><h2 id="notificationSettingsTitle">结算提醒</h2><span>按企业时区每天发送一次应收、应付与逾期汇总</span></div><span class="status-badge ${enabled ? "settled" : "draft"}">${enabled ? "已启用" : "未启用"}</span></div>
+    <div class="notification-settings-body">${verificationNote}
+      <form id="notificationPreferencesForm" class="notification-preferences-form" aria-busy="${saving}">
+        <fieldset ${saving ? "disabled" : ""}>
+          <div class="notification-enable-row"><div><strong id="notificationEnabledLabel">每日结算提醒</strong><span id="notificationEnabledHint">未验证手机号时不能开启</span></div><label class="switch"><input id="notificationEnabled" type="checkbox" role="switch" aria-labelledby="notificationEnabledLabel" aria-describedby="notificationEnabledHint notificationVerificationNote" ${enabled ? "checked" : ""} ${enableDisabled ? "disabled" : ""} /><span aria-hidden="true"></span></label></div>
+          <div class="notification-preference-grid"><label>发送时间<input id="notificationSendLocalTime" type="time" value="${escapeAttr(draft.sendLocalTime || "09:00")}" step="60" required /></label><label>提前提醒天数<input id="notificationAdvanceDays" type="number" value="${escapeAttr(draft.advanceDays)}" min="0" max="365" step="1" inputmode="numeric" required /></label></div>
+          <div class="notification-preference-checks" role="group" aria-label="提醒范围"><label class="check-label"><input id="notificationReceivableEnabled" type="checkbox" ${draft.receivableEnabled ? "checked" : ""} />客户应收</label><label class="check-label"><input id="notificationPayableEnabled" type="checkbox" ${draft.payableEnabled ? "checked" : ""} />供应商应付</label><label class="check-label"><input id="notificationOverdueDaily" type="checkbox" ${draft.overdueDaily ? "checked" : ""} />逾期后每天提醒</label></div>
+        </fieldset>
+        <div class="notification-form-footer"><p id="notificationSettingsFeedback" class="notification-settings-feedback ${state.notificationSettingsSaveStatus === "error" ? "error" : ""} ${feedbackMessage ? "" : "hidden"}" role="${feedbackRole}" aria-live="${feedbackRole === "alert" ? "assertive" : "polite"}">${escapeHtml(feedbackMessage)}</p><button id="notificationSettingsSubmit" class="primary-button" type="submit" ${saving ? "disabled" : ""}>${icon(saving ? "loader-circle" : "save", 15)}${saving ? "正在保存" : "保存提醒设置"}</button></div>
+      </form>
+    </div>
+  </section>`;
+}
+
+function captureNotificationPreferenceDraft(form) {
+  state.notificationPreferenceDraft = {
+    enabled: byId("notificationEnabled")?.checked === true,
+    sendLocalTime: byId("notificationSendLocalTime")?.value || "",
+    advanceDays: byId("notificationAdvanceDays")?.value ?? "",
+    overdueDaily: byId("notificationOverdueDaily")?.checked === true,
+    receivableEnabled: byId("notificationReceivableEnabled")?.checked === true,
+    payableEnabled: byId("notificationPayableEnabled")?.checked === true,
+    version: state.notificationSettings?.preference.version ?? 0
+  };
+  if (state.notificationSettingsSaveStatus !== "saving") {
+    state.notificationSettingsSaveStatus = "idle";
+    state.notificationSettingsSaveError = "";
+    const feedback = form.querySelector("#notificationSettingsFeedback");
+    if (feedback) {
+      feedback.textContent = "";
+      feedback.classList.add("hidden");
+    }
+  }
+}
+
 function renderSettingsView() {
   const { tenant, user, role } = state.data;
   const canReadAudit = role === "owner" || role === "finance";
   const canManageMembers = role === "owner";
-  byId("view-settings").innerHTML = `<div class="view-heading"><div><p class="eyebrow">WORKSPACE SETTINGS</p><h1>工作区设置</h1><p>企业、成员和安全记录均以服务器数据为准。</p></div></div><div class="settings-grid"><section class="settings-list"><div class="setting-row"><div><strong>企业</strong><span dir="auto">${escapeHtml(tenant.name)}</span></div><span class="settings-value">${escapeHtml(tenant.timezone)}</span></div><div class="setting-row"><div><strong>当前成员</strong><span dir="auto">${escapeHtml(user.displayName)} · ${escapeHtml(user.phone)}</span></div><span class="status-badge pending">${escapeHtml(roleLabels[role])}</span></div><div class="setting-row"><div><strong>账号密码</strong><span>修改后撤销其他设备上的登录会话</span></div><button class="outline-button small-button" data-action="change-password">修改密码</button></div><div class="setting-row"><div><strong>会话安全</strong><span>优先同源 HttpOnly cookie；兼容令牌仅保存在页面内存</span></div>${icon("shield-check",20)}</div></section><section class="settings-list"><div class="setting-row"><div><strong>微信 / 短信 / 电话</strong><span>发送服务、模板审核和失败重试待接入</span></div><span class="integration-tag">待接入</span></div><div class="setting-row"><div><strong>Excel 导入</strong><span>CSV / XLSX 安全解析、字段映射、校验和审计已启用</span></div><span class="integration-tag import-ready-tag">已启用</span></div><div class="setting-row"><div><strong>纸单 OCR</strong><span>等待阿里云 OCR 与对象存储服务开通</span></div><span class="integration-tag">待接入</span></div><div class="setting-row"><div><strong>退出登录</strong><span>撤销当前服务端会话并清除安全 cookie</span></div><button class="outline-button small-button" data-action="logout">安全退出</button></div></section></div>${canManageMembers ? memberPanelMarkup() : ""}${canReadAudit ? auditPanelMarkup() : ""}`;
+  const notificationPanel = canReadAudit ? notificationSettingsPanelMarkup() : "";
+  byId("view-settings").innerHTML = `<div class="view-heading"><div><p class="eyebrow">WORKSPACE SETTINGS</p><h1>工作区设置</h1><p>企业、成员和安全记录均以服务器数据为准。</p></div></div><div class="settings-grid"><section class="settings-list"><div class="setting-row"><div><strong>企业</strong><span dir="auto">${escapeHtml(tenant.name)}</span></div><span class="settings-value">${escapeHtml(tenant.timezone)}</span></div><div class="setting-row"><div><strong>当前成员</strong><span dir="auto">${escapeHtml(user.displayName)}</span></div><span class="status-badge pending">${escapeHtml(roleLabels[role])}</span></div><div class="setting-row"><div><strong>账号密码</strong><span>修改后撤销其他设备上的登录会话</span></div><button class="outline-button small-button" data-action="change-password">修改密码</button></div><div class="setting-row"><div><strong>会话安全</strong><span>优先同源 HttpOnly cookie；兼容令牌仅保存在页面内存</span></div>${icon("shield-check",20)}</div></section><section class="settings-list"><div class="setting-row"><div><strong>短信登录与提醒</strong><span>验证码登录已具备；主动提醒按真实服务验收启用</span></div><span class="integration-tag">分阶段启用</span></div><div class="setting-row"><div><strong>Excel 导入</strong><span>CSV / XLSX 安全解析、字段映射、校验和审计已启用</span></div><span class="integration-tag import-ready-tag">已启用</span></div><div class="setting-row"><div><strong>纸单 OCR</strong><span>等待阿里云 OCR 与对象存储服务开通</span></div><span class="integration-tag">待接入</span></div><div class="setting-row"><div><strong>退出登录</strong><span>撤销当前服务端会话并清除安全 cookie</span></div><button class="outline-button small-button" data-action="logout">安全退出</button></div></section></div>${notificationPanel}${canManageMembers ? memberPanelMarkup() : ""}${canReadAudit ? auditPanelMarkup() : ""}`;
+  const notificationForm = byId("notificationPreferencesForm");
+  if (notificationForm) {
+    notificationForm.addEventListener("input", () => captureNotificationPreferenceDraft(notificationForm));
+    notificationForm.addEventListener("change", () => captureNotificationPreferenceDraft(notificationForm));
+    notificationForm.addEventListener("submit", saveNotificationSettings);
+  }
+}
+
+async function loadNotificationSettings({ force = false } = {}) {
+  if (!canManageNotificationSettings()) return;
+  if (!force && (state.notificationSettingsStatus === "loading" || state.notificationSettingsStatus === "ready")) return;
+  state.notificationSettingsStatus = "loading";
+  state.notificationSettingsError = "";
+  if (state.view === "settings") renderSettingsView();
+  try {
+    const payload = await apiRequest("/api/notification-settings/me", { busyText: "正在读取提醒设置" });
+    state.notificationSettings = normalizeNotificationSettings(payload);
+    state.notificationPreferenceDraft = notificationPreferenceDraft(state.notificationSettings.preference);
+    state.notificationSettingsStatus = "ready";
+    state.notificationSettingsSaveStatus = "idle";
+    state.notificationSettingsSaveError = "";
+  } catch (error) {
+    state.notificationSettings = null;
+    state.notificationPreferenceDraft = null;
+    state.notificationSettingsStatus = "error";
+    state.notificationSettingsError = error.message;
+  }
+  if (state.view === "settings") {
+    renderSettingsView();
+    refreshIcons();
+  }
+}
+
+async function saveNotificationSettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!state.notificationSettings || !state.notificationSettings.eligible || state.notificationSettingsSaveStatus === "saving") return;
+  captureNotificationPreferenceDraft(form);
+  if (!form.reportValidity()) return;
+  const draft = state.notificationPreferenceDraft;
+  const advanceDays = Number(draft.advanceDays);
+  if (!Number.isInteger(advanceDays) || advanceDays < 0 || advanceDays > 365) return;
+  const body = {
+    enabled: state.notificationSettings.phoneVerified && draft.enabled === true,
+    sendLocalTime: draft.sendLocalTime || "09:00",
+    advanceDays,
+    overdueDaily: draft.overdueDaily === true,
+    receivableEnabled: draft.receivableEnabled === true,
+    payableEnabled: draft.payableEnabled === true,
+    version: state.notificationSettings.preference.version
+  };
+  state.notificationSettingsSaveStatus = "saving";
+  state.notificationSettingsSaveError = "";
+  renderSettingsView();
+  refreshIcons();
+  try {
+    const payload = await apiRequest("/api/notification-settings/me", {
+      method: "PUT",
+      body,
+      busyText: "正在保存提醒设置"
+    });
+    const mergedPayload = payload?.preference
+      ? {
+          eligible: payload.eligible ?? state.notificationSettings.eligible,
+          phoneMasked: payload.phoneMasked ?? state.notificationSettings.phoneMasked,
+          phoneVerified: payload.phoneVerified ?? state.notificationSettings.phoneVerified,
+          preference: payload.preference
+        }
+      : await apiRequest("/api/notification-settings/me", { busyText: "正在确认提醒设置" });
+    state.notificationSettings = normalizeNotificationSettings(mergedPayload);
+    state.notificationPreferenceDraft = notificationPreferenceDraft(state.notificationSettings.preference);
+    state.notificationSettingsStatus = "ready";
+    state.notificationSettingsSaveStatus = "success";
+    showToast("提醒设置已保存", "success");
+  } catch (error) {
+    state.notificationSettingsSaveStatus = "error";
+    state.notificationSettingsSaveError = error.message;
+  }
+  if (state.view === "settings") {
+    renderSettingsView();
+    refreshIcons();
+    window.requestAnimationFrame(() => byId("notificationSettingsSubmit")?.focus());
+  }
 }
 
 function memberStatus(member) {
@@ -1398,6 +1776,7 @@ function setView(view, scroll = true) {
   if (scroll) window.scrollTo({ top: 0, behavior: "auto" });
   refreshIcons();
   if (view === "settings") {
+    void loadNotificationSettings();
     void loadAudit();
     void loadMembers();
   }
@@ -2251,6 +2630,26 @@ function rerenderOrderTables() {
 
 function bindEvents() {
   byId("loginForm").addEventListener("submit", login);
+  byId("smsLoginForm").addEventListener("submit", loginWithSms);
+  byId("smsCodeSend").addEventListener("click", requestSmsCode);
+  byId("smsLoginPhone").addEventListener("input", (event) => {
+    if (state.smsChallengeId && event.currentTarget.value.trim() !== state.smsChallengePhone) {
+      resetSmsChallenge("手机号已更改，请重新获取验证码");
+    }
+  });
+  for (const tab of [byId("passwordLoginTab"), byId("smsLoginTab")]) {
+    tab.addEventListener("click", () => setAuthMode(tab.id === "smsLoginTab" ? "sms" : "password"));
+    tab.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const smsMode = event.key === "ArrowRight" || event.key === "End";
+      setAuthMode(smsMode ? "sms" : "password", { focus: false });
+      byId(smsMode ? "smsLoginTab" : "passwordLoginTab").focus();
+    });
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.smsCountdownEndsAt) updateSmsCountdown();
+  });
   byId("logoutButton").addEventListener("click", (event) => logout(event.currentTarget));
   byId("mobileMenu").addEventListener("click", () => setSidebarOpen(!byId("sidebar").classList.contains("open")));
   byId("sidebarClose").addEventListener("click", () => setSidebarOpen(false));
@@ -2357,6 +2756,7 @@ function bindEvents() {
       if (type === "change-password") openPasswordModal();
       if (type === "refresh-audit") await loadAudit({ force: true });
       if (type === "refresh-members") await loadMembers({ force: true });
+      if (type === "refresh-notification-settings") await loadNotificationSettings({ force: true });
       if (type === "invite-member") openMemberModal();
       if (type === "toggle-member") await toggleMember(action.dataset.memberId, action.dataset.active === "true", action);
       if (type === "reinvite-member") await reinviteMember(action.dataset.memberId, action);

@@ -15,6 +15,16 @@ export function isPostgresConnectionString(value: string): boolean {
   return /^postgres(?:ql)?:\/\//i.test(value);
 }
 
+function hasRequiredPostgresSsl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const modes = url.searchParams.getAll("sslmode").map((mode) => mode.trim().toLowerCase());
+    return modes.length === 1 && ["require", "verify-ca", "verify-full"].includes(modes[0] ?? "");
+  } catch {
+    return false;
+  }
+}
+
 export async function createPgliteDatabase(dataDir?: string): Promise<Database> {
   if (dataDir && dataDir !== ":memory:") {
     const absolute = resolve(dataDir);
@@ -94,6 +104,9 @@ export async function createDatabase(options: {
   if (options.databaseUrl) {
     if (!isPostgresConnectionString(options.databaseUrl)) {
       throw new Error("DATABASE_URL must use the postgres:// or postgresql:// scheme");
+    }
+    if (options.isProduction && !hasRequiredPostgresSsl(options.databaseUrl)) {
+      throw new Error("Production DATABASE_URL must contain exactly one sslmode=require, verify-ca, or verify-full");
     }
     return createPostgresDatabase(options.databaseUrl);
   }

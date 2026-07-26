@@ -14,6 +14,10 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@alicloud/credentials": "^2.4.5",
+    "@alicloud/dysmsapi20170525": "^4.6.0",
+    "@alicloud/openapi-client": "^0.4.15",
+    "@alicloud/tea-util": "^1.4.11",
     "@electric-sql/pglite": "^0.3.14",
     "@fastify/cookie": "^11.0.2",
     "@fastify/helmet": "^13.0.2",

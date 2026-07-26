@@ -39,7 +39,7 @@ npm run dev
 不设置 `DATABASE_URL` 时使用 `.pglite` 本地数据库。连接生产 PostgreSQL 时设置：
 
 ```bash
-DATABASE_URL=postgres://settlement:strong-password@db-host:5432/settlement
+DATABASE_URL=postgres://settlement:strong-password@db-host:5432/settlement?sslmode=require&connect_timeout=5
 REDIS_URL=rediss://settlement-app:strong-password@tair-private-host:6379/0
 REDIS_KEY_PREFIX=siyan-settlement-666:production:
 NODE_ENV=production
@@ -76,12 +76,13 @@ unset PROVISION_OWNER_PASSWORD
 
 ## 迁移规则
 
-只允许新增按序编号的 SQL 文件，禁止修改或删除已发布的 `001` 至 `008`。首次从旧版
+只允许新增按序编号的 SQL 文件，禁止修改或删除已发布的 `001` 至 `009`。首次从旧版
 `schema_migrations` 升级时，系统会增加 `checksum` 并以当前文件建立基线；此后任何历史
 文件变化都会阻止迁移。迁移在同一数据库事务中持有 advisory lock，避免多个实例同时执行。
 `003` 为旧版 `001` 数据库补齐企业时区、联系人版本及交货日期约束；`004` 新增只追加的
 付款冲销记录；`005` 为付款与审计记录增加数据库防修改/删除触发器；`006` 增加只存摘要、
-可过期和可撤销的成员邀请；`007` 增加只追加的订单更正快照；`008` 增加导入批次和订单来源关联。
+可过期和可撤销的成员邀请；`007` 增加只追加的订单更正快照；`008` 增加导入批次和订单来源关联；
+`009` 增加手机号验证状态、提醒偏好、持久 outbox、发送尝试、回执记录和 worker 心跳。
 若旧库已有违反约束的数据，迁移会失败并要求
 人工核实，不会自动伪造或覆盖历史记录。
 
@@ -109,7 +110,8 @@ CI 还会把 `tests/app.test.ts` 在一个名称以 `_ci` 结尾的空 PostgreSQ
 分币种余额、联系人版本冲突、成员邀请/重发/角色/启停/最后 owner 并发保护、Cookie 登录/登出、修改密码、
 手机号规范化登录限流、可信代理边界、Cookie Origin 防护、用户行锁、API 禁止缓存、
 SPA 回退、安全响应头、请求体上限、UTF-8 中英阿文本、受控订单更正、CSV/XLSX 安全解析、
-人工字段映射、导入幂等与租户隔离、发布工件、加密备份及恢复演练守卫。
+人工字段映射、导入幂等与租户隔离、短信验证码一次性消费和限流、提醒设置并发保护、通知 outbox、
+发布工件、加密备份及恢复演练守卫。
 
 ## 核心规则
 
@@ -164,9 +166,13 @@ Cookie 会话执行 `POST`、`PUT`、`PATCH` 或 `DELETE` 时必须携带与 `PU
 | --- | --- | --- |
 | GET | `/api/health` | 数据库与 Redis 健康状态；Redis 故障返回 HTTP 200 + `degraded`，数据库故障返回 503 |
 | POST | `/api/auth/login` | 手机号密码登录 |
+| POST | `/api/auth/sms-codes` | 请求短信验证码；统一返回 202，真实发送需 `SMS_ENABLED=true` 和已审核的阿里云短信配置 |
+| POST | `/api/auth/sms-login` | 手机号 + challenge ID + 一次性验证码登录 |
 | POST | `/api/auth/accept-invitation` | 邀请令牌 + 至少 12 位密码；令牌只能使用一次 |
 | POST | `/api/auth/logout` | 撤销当前 session 并清除 Cookie |
 | POST | `/api/auth/change-password` | 当前密码 + 至少 12 位新密码 |
+| GET | `/api/notification-settings/me` | owner / finance；读取本人短信提醒偏好和手机号验证状态 |
+| PUT | `/api/notification-settings/me` | owner / finance；携带版本保存本人提醒偏好，启用前必须验证手机号并明确同意 |
 | GET | `/api/bootstrap` | 当前租户初始化数据 |
 | GET | `/api/members` | owner；列出当前企业成员与邀请状态 |
 | POST | `/api/members` | owner；创建未启用成员并返回一次性 72 小时邀请令牌 |
@@ -243,8 +249,11 @@ curl -X POST http://127.0.0.1:666/api/orders/ORDER_ID/payments \
 双角色、OSS 对象锁和最小权限、Webhook 到达、IP 证书续期链路、阿里云安全组，以及从异地备份
 下载后在独立主机完成恢复演练。
 
-仍未接入的产品服务包括付款凭证 OSS 直传与文件扫描、阿里云短信/语音/OCR、微信通知、定时通知
-worker、短信验证码、集中日志平台，以及完整阿拉伯语 UI/RTL。登录限流已经使用 Redis 原子脚本，
-并按 IP、手机号及两者组合做哈希后的跨实例限制；Redis 故障时登录失败关闭，已登录账务请求仍以
-PostgreSQL 为准继续处理。数据库 RLS、通用幂等响应快照和可校验的
+短信验证码接口、响应式登录入口、通知 outbox、阿里云提醒发送适配器、worker 入口和 systemd/心跳
+检查已经具备，但阿里云真实签名、模板、ECS RAM 角色、MNS 回执消费者及真实收件验收尚未完成；
+完成前必须保持 `SMS_ENABLED=false` 且不启用 reminder worker。仍未接入的产品服务包括付款凭证
+OSS 直传与文件
+扫描、阿里云语音/OCR、微信通知、集中日志平台，以及完整阿拉伯语 UI/RTL。登录限流已经使用 Redis
+原子脚本，并按 IP、手机号及两者组合做哈希后的跨实例限制；Redis 故障时登录失败关闭，已登录账务
+请求仍以 PostgreSQL 为准继续处理。数据库 RLS、通用幂等响应快照和可校验的
 密码学审计链属于公开大规模上线前的进一步加固。生产环境不得使用演示密码或 `SEED_DEMO=true`。

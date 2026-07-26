@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Siyan Settlement 666 reminder worker heartbeat every minute
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=1m
+RandomizedDelaySec=10s
+AccuracySec=10s
+Unit=siyan-settlement-666-reminder-worker-health-check.service
+
+[Install]
+WantedBy=timers.target

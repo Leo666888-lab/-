@@ -18,4 +18,11 @@ describe("database production guards", () => {
     await expect(createDatabase({ isProduction: true })).rejects.toThrow(/Production database/);
     await expect(createDatabase({ isProduction: true, databaseUrl: "pglite://local/db" })).rejects.toThrow(/Production database/);
   });
+
+  it("requires one explicit PostgreSQL SSL mode in production", async () => {
+    await expect(createDatabase({
+      isProduction: true,
+      databaseUrl: "postgresql://worker:test@database.test/settlement",
+    })).rejects.toThrow(/exactly one sslmode=require, verify-ca, or verify-full/);
+  });
 });

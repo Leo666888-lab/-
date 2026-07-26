@@ -32,7 +32,7 @@ done
 tar_version="$(tar --version)"
 [[ "${tar_version%%$'\n'*}" == "tar (GNU tar)"* ]] || die "release artifacts require GNU tar"
 
-for required_path in dist/src/server.js dist/src/cli/migrate.js public/index.html migrations deploy package.json package-lock.json; do
+for required_path in dist/src/server.js dist/src/worker.js dist/src/cli/migrate.js public/index.html migrations deploy package.json package-lock.json; do
   [[ -e "${REPOSITORY_ROOT}/${required_path}" ]] || die "required release input is missing: ${required_path}"
 done
 
@@ -61,11 +61,13 @@ npm_config_audit=false npm_config_fund=false npm ci --omit=dev --prefix "${relea
 cp -a "${REPOSITORY_ROOT}/dist" "${REPOSITORY_ROOT}/public" \
   "${REPOSITORY_ROOT}/migrations" "${REPOSITORY_ROOT}/deploy" "${release_root}/"
 
-for required_path in dist/src/server.js dist/src/cli/migrate.js public/index.html \
+for required_path in dist/src/server.js dist/src/worker.js dist/src/cli/migrate.js public/index.html \
   deploy/scripts/siyan-settlement-666-postgres-backup.sh \
   deploy/scripts/siyan-settlement-666-preflight.sh \
+  deploy/scripts/siyan-settlement-666-activate-release.sh \
   deploy/scripts/siyan-settlement-666-restore-drill.sh \
   deploy/scripts/siyan-settlement-666-health-check.sh \
+  deploy/scripts/siyan-settlement-666-reminder-worker-health-check.sh \
   deploy/scripts/siyan-settlement-666-tls-check.sh \
   deploy/scripts/siyan-settlement-666-alert.sh \
   deploy/scripts/parse-postgres-database-url.mjs \
@@ -77,8 +79,10 @@ done
 for executable_path in \
   deploy/scripts/siyan-settlement-666-postgres-backup.sh \
   deploy/scripts/siyan-settlement-666-preflight.sh \
+  deploy/scripts/siyan-settlement-666-activate-release.sh \
   deploy/scripts/siyan-settlement-666-restore-drill.sh \
   deploy/scripts/siyan-settlement-666-health-check.sh \
+  deploy/scripts/siyan-settlement-666-reminder-worker-health-check.sh \
   deploy/scripts/siyan-settlement-666-tls-check.sh \
   deploy/scripts/siyan-settlement-666-alert.sh; do
   [[ -x "${release_root}/${executable_path}" ]] \

@@ -5,6 +5,29 @@
 > 本清单全部是待开通、待配置、待验证事项，不代表任何资源已经购买或通过验收。第一次操作建议由
 > 熟悉阿里云网络和数据库的人员陪同复核。密码、验证码、AccessKey 和完整连接串不得发到聊天中。
 
+## 0. 企业认证等待期：现在可以完成什么
+
+企业实名认证通常需要 2–3 个工作日。等待期间不需要停工，以下事项可以先完成，而且不依赖短信
+签名或企业主体资质：
+
+- [ ] 在本地和 CI 跑完 TypeScript、后端、Worker、导入、响应式前端和安全回归测试。
+- [ ] 用 `fake` 短信/提醒 provider 验收验证码过期、限流、重复提交、分次收付款和提醒重试；生产环境仍必须保持 `SMS_ENABLED=false`，提醒 worker 保持 disabled。
+- [ ] 准备正式业务参数：企业时区、提醒发送时间、提前天数、应收/应付负责人、成员角色、账期规则和备份保留期。
+- [ ] 选择正式域名并确认备案路径；域名、ICP 备案和证书是公网商业入口的独立工作，不应和本地 `127.0.0.1` 验收混淆。
+- [ ] 先完成专用 VPC、交换机、安全组、ECS、RDS、Tair 的网络规划；实际购买前再次核对地域、VPC、私网和端口隔离。
+- [ ] 在独立测试环境做一次发布包校验、迁移、备份恢复演练和桌面/手机端验收。
+
+以下事项通常要等企业主体认证或服务审核，当前不要用个人测试配置冒充生产完成：
+
+- [ ] 阿里云短信签名、登录验证码模板和每日结算摘要模板审核通过。
+- [ ] ECS RAM 角色、短信余额/日发送量告警和真实手机闭环验收。
+- [ ] MNS 回执消费者、真实提醒去重和失败告警闭环验收。
+- [ ] OSS 异地不可变备份、OCR、微信通知等增值服务的资质、费用和权限验收。
+
+可以回传给开发人员的只有非敏感信息：地域、VPC/交换机/安全组 ID、ECS/RDS/Tair 实例 ID、私网
+主机名、端口、数据库名和账号名。密码、AccessKey、短信密钥、证书私钥、完整连接串和验证码只在
+阿里云密钥管理或受限 ECS 配置文件中保存，不能发到聊天、截图或 Git。
+
 ## 1. 先确定统一范围
 
 - [ ] 确定一个阿里云地域，ECS、RDS 和 Tair 全部放在该地域。
@@ -68,13 +91,13 @@ RDS 是订单、收付款、审计和幂等记录的最终可信数据源。任�
   `SET`、`DEL`、`EVAL`、`INCR`、`EXPIRE` 和 `TTL`，并禁止 `FLUSHALL`、`FLUSHDB`、`CONFIG`、
   `KEYS`、`SHUTDOWN` 等管理或全库命令。
 - [ ] 使用独立键前缀 `siyan-settlement-666:production:`，所有临时键必须设置 TTL。
-- [ ] 淘汰策略选择 `noeviction`，避免在不知情时删除登录或任务锁数据。
+- [ ] 淘汰策略选择 `noeviction`，避免在不知情时删除验证码、发送冷却或登录限流数据。
 - [ ] 开启持久化/AOF 和每日自动备份，建议保留至少 `7 天`。
 - [ ] 开启释放保护、删除保护或回收站（以控制台实际提供的选项为准）。
 - [ ] 记录实例 ID、私网地址、TLS 端口、ACL 账号名、数据库编号、版本和备份保留期。
 
-Tair 只用于验证码、登录限流、会话加速、提醒任务锁和短期防重复；清空 Tair 不应造成账务数据
-丢失或重复记账。
+Tair 当前只用于验证码、发送冷却和登录限流；会话、提醒 outbox、发送租约和防重复状态保存在
+PostgreSQL。清空 Tair 不应造成账务数据丢失或重复记账，但会使短信验证和登录保护暂时不可用。
 
 ## 3. 监控和告警
 
@@ -131,7 +154,25 @@ PUBLIC_ORIGIN=EXACT_HTTPS_BROWSER_ORIGIN
 SESSION_TTL_HOURS=168
 BODY_LIMIT_BYTES=1048576
 LOGIN_RATE_LIMIT_MAX=5
+SMS_ENABLED=false
+SMS_CODE_TTL_SECONDS=300
+SMS_RESEND_COOLDOWN_SECONDS=60
+SMS_VERIFY_MAX_ATTEMPTS=5
+SMS_SEND_RATE_LIMIT_MAX=5
+SMS_SEND_RATE_LIMIT_IP_MAX=20
+SMS_SEND_RATE_LIMIT_WINDOW_SECONDS=3600
+NOTIFICATION_PROVIDER=fake
+NOTIFICATION_WORKER_NAME=settlement-reminders
+NOTIFICATION_POLL_INTERVAL_MS=30000
+NOTIFICATION_BATCH_SIZE=5
+NOTIFICATION_LEASE_SECONDS=120
+NOTIFICATION_MAX_ATTEMPTS=5
+ALIYUN_SMS_DIGEST_TEMPLATE_CODE=SMS_已审核每日摘要模板编号
+RELEASE_ID=当前发布目录的40位Git提交SHA
 ```
+
+Worker 当前串行发送；租约必须至少为 `批量大小 * 15 秒 + 30 秒`。保持示例的 5 条/120 秒，除非同时
+调整并重新验收两项参数。
 
 `PUBLIC_ORIGIN` 必须与用户浏览器中的完整 HTTPS 来源一致，例如正式域名的 `https://域名`，或当前
 验收入口的 `https://公网IP:666`。不要用 `cat` 打印配置文件来验收权限，只检查上面 `stat` 的结果
@@ -156,7 +197,8 @@ LOGIN_RATE_LIMIT_MAX=5
 
 下列能力不能因为 ECS、RDS 和 Tair 开通就视为完成：
 
-- [ ] 阿里云短信：尚未开通真实签名、模板和发送凭据；当前测试验证码不能用于商业生产登录。
+- [ ] 阿里云短信：登录接口和前端流程已经具备，但真实签名、模板、ECS RAM 角色和发送验收未完成；完成前保持 `SMS_ENABLED=false`。
+- [ ] 提醒 worker：systemd、阿里云发送适配器和心跳检查已经具备，但每日提醒模板、MNS 回执消费者和真实去重验收未完成；完成前保持 service/timer disabled。
 - [ ] OCR：尚未开通并验证真实纸单识别服务、费用、准确率和人工校对流程。
 - [ ] 微信：尚未开通公众号/小程序通知能力，也未完成用户授权、模板和回调验收。
 - [ ] OSS：尚未建立独立、加密、不可变的异地备份桶和最小权限账号。

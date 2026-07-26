@@ -16,7 +16,7 @@ describe("migration integrity", () => {
       const applied = await database.query<{ name: string; checksum: string }>(
         "SELECT name, checksum FROM schema_migrations ORDER BY name",
       );
-      expect(applied.rows).toHaveLength(8);
+      expect(applied.rows).toHaveLength(9);
       expect(applied.rows.every((row) => row.checksum.trim().length === 64)).toBe(true);
 
       for (const name of (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql"))) {
@@ -62,6 +62,20 @@ describe("migration integrity", () => {
           tenant_id uuid NOT NULL,
           order_id uuid NOT NULL
         );
+        CREATE TABLE reminders (
+          id uuid PRIMARY KEY,
+          tenant_id uuid NOT NULL REFERENCES tenants(id),
+          order_id uuid NOT NULL,
+          due_at timestamptz NOT NULL,
+          status varchar(16) NOT NULL DEFAULT 'open',
+          snoozed_until timestamptz,
+          acknowledged_at timestamptz,
+          closed_at timestamptz,
+          created_at timestamptz NOT NULL DEFAULT now(),
+          updated_at timestamptz NOT NULL DEFAULT now(),
+          CONSTRAINT reminders_order_tenant_fk FOREIGN KEY (tenant_id, order_id)
+            REFERENCES orders(tenant_id, id)
+        );
         CREATE TABLE audit_logs (
           id uuid PRIMARY KEY,
           tenant_id uuid NOT NULL
@@ -83,10 +97,15 @@ describe("migration integrity", () => {
       await migrate(database);
       const tenant = await database.query<{ timezone: string }>("SELECT timezone FROM tenants");
       const partner = await database.query<{ version: number }>("SELECT version FROM partners");
+      const userColumns = await database.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'users' AND column_name = 'phone_verified_at'`,
+      );
       const migrations = await database.query<{ checksum: string }>("SELECT checksum FROM schema_migrations");
       expect(tenant.rows[0]?.timezone).toBe("Asia/Shanghai");
       expect(Number(partner.rows[0]?.version)).toBe(1);
-      expect(migrations.rows).toHaveLength(8);
+      expect(userColumns.rowCount).toBe(1);
+      expect(migrations.rows).toHaveLength(9);
       expect(migrations.rows.every((row) => row.checksum.trim().length === 64)).toBe(true);
 
       await expect(database.query(

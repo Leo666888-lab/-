@@ -35,6 +35,10 @@ const parseDatabaseUrl = (value, label) => {
   if (!username || !password || !host || !database) {
     fail(`${label} must include a host, username, password, and database name`);
   }
+  const sslModes = parsed.searchParams.getAll("sslmode");
+  if (sslModes.length !== 1 || !["require", "verify-ca", "verify-full"].includes(sslModes[0])) {
+    fail(`${label} must require PostgreSQL SSL`);
+  }
   return {
     host,
     port: parsed.port || "5432",

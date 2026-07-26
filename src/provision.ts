@@ -3,12 +3,22 @@ import { z } from "zod";
 import type { Database } from "./db/types.js";
 import { writeAudit } from "./lib/audit.js";
 import { ApiError } from "./lib/errors.js";
+import { normalizePhone } from "./lib/phone.js";
 import { newId } from "./lib/security.js";
+
+const ownerPhoneSchema = z.string().max(64).transform((value, context) => {
+  const normalized = normalizePhone(value);
+  if (!normalized) {
+    context.addIssue({ code: "custom", message: "invalid owner phone" });
+    return z.NEVER;
+  }
+  return normalized;
+});
 
 const provisionOwnerSchema = z.object({
   tenantName: z.string().trim().min(1).max(200),
   tenantTimezone: z.string().trim().min(1).max(100).default("Asia/Shanghai"),
-  ownerPhone: z.string().trim().min(5).max(32),
+  ownerPhone: ownerPhoneSchema,
   ownerName: z.string().trim().min(1).max(100),
   ownerPassword: z.string().min(12).max(128),
 }).strict().superRefine((input, context) => {

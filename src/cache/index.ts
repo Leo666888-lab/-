@@ -16,6 +16,7 @@ export async function createCache(options: {
 }
 
 export { registerDependencyReadiness } from "./health.js";
+export { MemoryCache } from "./memory.js";
 export { NoopCache } from "./noop.js";
 export type {
   Cache,
@@ -23,4 +24,6 @@ export type {
   CacheReadiness,
   FixedWindowResult,
   FixedWindowRule,
+  OneTimeValueResult,
+  OneTimeValueStatus,
 } from "./types.js";
