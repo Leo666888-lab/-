@@ -55,7 +55,6 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 RemoveIPC=true
 ReadWritePaths=/var/lib/siyan-settlement-666
-ReadOnlyPaths=/etc/siyan-settlement-666/app /opt/siyan-settlement-666/current
 InaccessiblePaths=/etc/siyan-settlement-666/backup /etc/siyan-settlement-666/monitor /var/backups/siyan-settlement-666
 LimitNOFILE=65536
 TasksMax=256
