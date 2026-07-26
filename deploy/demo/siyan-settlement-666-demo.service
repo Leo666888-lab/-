@@ -1,0 +1,66 @@
+[Unit]
+Description=Siyan Settlement 666 demonstration application
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=siyan-settlement-666-demo
+Group=siyan-settlement-666-demo
+SupplementaryGroups=siyan-settlement-666-release
+WorkingDirectory=/opt/siyan-settlement-666-demo/current
+EnvironmentFile=/etc/siyan-settlement-666-demo/app.env
+
+ExecStartPre=/usr/bin/test -r /etc/siyan-settlement-666-demo/app.env
+ExecStartPre=/usr/bin/test -r /opt/siyan-settlement-666-demo/current/dist/src/server.js
+ExecStartPre=/usr/bin/test -x /opt/siyan-settlement-666/runtime/node/bin/node
+ExecStartPre=/usr/bin/test -x /usr/bin/env
+ExecStart=/usr/bin/env NODE_ENV=development HOST=127.0.0.1 PORT=16666 SEED_DEMO=true PUBLIC_ORIGIN=https://123.56.254.236:666 /opt/siyan-settlement-666/runtime/node/bin/node /opt/siyan-settlement-666-demo/current/dist/src/server.js
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+StateDirectory=siyan-settlement-666-demo
+StateDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+RemoveIPC=true
+ReadWritePaths=/var/lib/siyan-settlement-666-demo
+ReadOnlyPaths=/etc/siyan-settlement-666-demo /opt/siyan-settlement-666-demo/current
+InaccessiblePaths=/etc/siyan-settlement-666 /var/backups/siyan-settlement-666
+LimitNOFILE=65536
+TasksMax=256
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=siyan-settlement-666-demo
+
+[Install]
+WantedBy=multi-user.target
