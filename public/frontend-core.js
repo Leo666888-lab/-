@@ -219,7 +219,17 @@ export function normalizeBootstrap(raw = {}) {
     orders: Array.isArray(raw.orders) ? raw.orders.map(normalizeOrder) : [],
     partners: Array.isArray(raw.partners) ? raw.partners.map(normalizePartner) : [],
     reminders: Array.isArray(raw.reminders) ? raw.reminders.map(normalizeReminder) : [],
-    recentPayments: Array.isArray(raw.recentPayments) ? raw.recentPayments.map(normalizeRecentPayment) : []
+    recentPayments: Array.isArray(raw.recentPayments) ? raw.recentPayments.map(normalizeRecentPayment) : [],
+    accounting: {
+      accounts: Array.isArray(raw.accounting?.accounts) ? raw.accounting.accounts.map((account) => ({
+        code: asText(account?.code),
+        name: asText(account?.name),
+        category: asText(account?.category),
+        debitCents: asCents(account?.debitCents),
+        creditCents: asCents(account?.creditCents),
+        balanceCents: Number.isSafeInteger(Number(account?.balanceCents)) ? Number(account.balanceCents) : 0
+      })) : []
+    }
   };
 }
 

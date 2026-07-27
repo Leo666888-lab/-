@@ -16,6 +16,7 @@ import { hashSessionToken, newId, newSessionToken } from "./lib/security.js";
 import { rescheduleQueuedDailyDigests } from "./notifications/service.js";
 import { SmsProviderError, type SmsProvider } from "./sms/index.js";
 import { postFulfillmentJournal, postPaymentJournal, postPaymentReversalJournal } from "./accounting.js";
+import { getAgingReport, getBalanceSheet, getIncomeStatement, getTrialBalance } from "./accounting-reports.js";
 
 const roleSchema = z.enum(["owner", "finance", "sales", "viewer"]);
 type Role = z.infer<typeof roleSchema>;
@@ -1762,7 +1763,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
 
   app.get("/api/bootstrap", async (request) => {
     const auth = await authenticate(database, request, publicOrigin);
-    const [ordersResult, partners, reminders, recentPaymentsResult] = await Promise.all([
+    const [ordersResult, partners, reminders, recentPaymentsResult, accountingSummary] = await Promise.all([
       database.query(
         `${orderSelect}
          WHERE o.tenant_id = $1
@@ -1789,7 +1790,21 @@ export function buildApp(options: AppOptions): FastifyInstance {
           AND reversal.order_id = pay.order_id
          WHERE pay.tenant_id = $1
          ORDER BY pay.paid_at DESC, pay.created_at DESC, pay.id DESC
-         LIMIT 6`,
+        LIMIT 6`,
+        [auth.tenantId],
+      ),
+      database.query(
+        `SELECT account.code, account.name, account.category,
+                COALESCE(SUM(line.debit_cents), 0)::text AS debit_cents,
+                COALESCE(SUM(line.credit_cents), 0)::text AS credit_cents
+         FROM accounting_accounts account
+         LEFT JOIN journal_lines line
+           ON line.tenant_id = account.tenant_id AND line.account_id = account.id
+         LEFT JOIN journal_entries entry
+           ON entry.tenant_id = line.tenant_id AND entry.id = line.journal_entry_id
+         WHERE account.tenant_id = $1 AND account.is_active = true
+         GROUP BY account.code, account.name, account.category
+         ORDER BY account.code`,
         [auth.tenantId],
       ),
     ]);
@@ -1812,6 +1827,18 @@ export function buildApp(options: AppOptions): FastifyInstance {
         paidAt: iso(row.paid_at),
         reversedAt: iso(row.reversed_at),
       })),
+      accounting: {
+        accounts: accountingSummary.rows.map((row) => ({
+          code: row.code,
+          name: row.name,
+          category: row.category,
+          debitCents: money(row.debit_cents),
+          creditCents: money(row.credit_cents),
+          balanceCents: ["liability", "equity", "revenue"].includes(String(row.category))
+            ? money(row.credit_cents) - money(row.debit_cents)
+            : money(row.debit_cents) - money(row.credit_cents),
+        })),
+      },
     };
   });
 
@@ -3194,6 +3221,34 @@ export function buildApp(options: AppOptions): FastifyInstance {
       id: row.id, start: dateOnly(row.period_start), end: dateOnly(row.period_end), status: row.status,
       closedAt: iso(row.closed_at), closedBy: row.closed_by,
     })) };
+  });
+
+  app.get("/api/accounting/trial-balance", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const query = parse(z.object({ period: z.string().optional() }).strict(), request.query);
+    return getTrialBalance(database, auth.tenantId, query.period);
+  });
+
+  app.get("/api/accounting/income-statement", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const query = parse(z.object({ period: z.string().optional() }).strict(), request.query);
+    return getIncomeStatement(database, auth.tenantId, query.period);
+  });
+
+  app.get("/api/accounting/balance-sheet", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const query = parse(z.object({ period: z.string().optional() }).strict(), request.query);
+    return getBalanceSheet(database, auth.tenantId, query.period);
+  });
+
+  app.get("/api/accounting/aging", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const query = parse(z.object({ period: z.string().optional() }).strict(), request.query);
+    return getAgingReport(database, auth.tenantId, query.period);
   });
 
   app.post("/api/accounting/periods/:id/close", async (request) => {

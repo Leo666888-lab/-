@@ -699,6 +699,48 @@ function overviewDueTrendMarkup(orders) {
   return `<div class="due-trend-summary"><strong>${total}</strong><span>笔未结订单按到期时间分布</span></div><div class="due-trend-list">${buckets.map(([key, label]) => `<div class="due-trend-row ${key}"><div><span>${label}</span><b>${counts[key]}</b></div><progress max="${maximum}" value="${counts[key]}" aria-label="${label} ${counts[key]} 笔"></progress></div>`).join("")}</div>`;
 }
 
+function accountingSnapshotMarkup() {
+  const accounts = state.data.accounting?.accounts || [];
+  const byCode = new Map(accounts.map((account) => [account.code, account]));
+  // Keep the result useful while an older demo process is still serving the
+  // page. The next bootstrap with accounting accounts replaces these values.
+  const cnyOrders = state.data.orders.filter((order) => order.currency === "CNY");
+  const cnyPayments = cnyOrders.reduce((sum, order) => sum + Number(order.paidCents || 0), 0);
+  const derived = {
+    cash: cnyPayments,
+    receivable: cnyOrders
+      .filter((order) => order.direction === "receivable" && order.fulfillmentStatus === "fulfilled")
+      .reduce((sum, order) => sum + Number(order.outstandingCents || 0), 0),
+    payable: cnyOrders
+      .filter((order) => order.direction === "payable" && order.fulfillmentStatus === "fulfilled")
+      .reduce((sum, order) => sum + Number(order.outstandingCents || 0), 0),
+    revenue: cnyOrders
+      .filter((order) => order.direction === "receivable" && order.fulfillmentStatus === "fulfilled")
+      .reduce((sum, order) => sum + Number(order.totalCents || 0), 0)
+  };
+  const accountBalance = (code, fallback, normalSide = "debit") => {
+    const account = byCode.get(code);
+    if (!account) return fallback;
+    const debit = Number(account.debitCents || 0);
+    const credit = Number(account.creditCents || 0);
+    return normalSide === "credit" ? credit - debit : debit - credit;
+  };
+  const cash = accounts.length ? accountBalance("1002", derived.cash) : derived.cash;
+  const receivable = accounts.length ? accountBalance("1122", derived.receivable) : derived.receivable;
+  const payable = accounts.length ? accountBalance("2202", derived.payable, "credit") : derived.payable;
+  const revenue = accounts.length ? accountBalance("5001", derived.revenue, "credit") : derived.revenue;
+  const cost = accounts.length ? accountBalance("5401", 0) : 0;
+  const profit = revenue - cost;
+  const items = [
+    ["银行存款", cash, "blue"],
+    ["应收账款", receivable, "green"],
+    ["应付账款", payable, "amber"],
+    ["本期收入", revenue, "green"],
+    ["本期利润（简化）", profit, profit >= 0 ? "green" : "red"]
+  ];
+  return `<section class="panel accounting-snapshot"><div class="panel-header"><div><h2>财务结果</h2><span>订单和收付款已自动沉淀为科目余额，金额按人民币主账簿计算。</span></div><button class="text-button" data-view="accounting">打开财务账簿 ${icon("arrow-up-right", 13)}</button></div><div class="accounting-snapshot-grid">${items.map(([label, cents, tone]) => `<div class="accounting-snapshot-item"><span>${label}</span><strong class="${tone}-text">${formatMoney(Number(cents), "CNY")}</strong></div>`).join("")}</div><div class="accounting-snapshot-note">${accounts.length ? "系统已生成科目余额、凭证和银行日记账。" : "当前显示订单台账推算结果；服务重启后将切换为正式科目余额。"}</div></section>`;
+}
+
 function renderOverview() {
   const orders = state.data.orders;
   const reminders = state.data.reminders;
@@ -720,6 +762,7 @@ function renderOverview() {
       <div class="kpi"><div class="kpi-top"><span>逾期未结</span><span class="kpi-icon red">${icon("triangle-alert")}</span></div>${directionalMoneyMarkup(groupDirectionalOutstanding(overdueOrders), "暂无逾期")}<small>${overdueOrders.length} 笔需要优先处理</small></div>
       <div class="kpi"><div class="kpi-top"><span>未来 7 天到期</span><span class="kpi-icon amber">${icon("calendar-clock")}</span></div>${directionalMoneyMarkup(groupDirectionalOutstanding(upcomingOrders), "暂无到期")}<small>${upcomingOrders.length} 笔即将到期</small></div>
     </div>
+    ${accountingSnapshotMarkup()}
     <div class="alert-banner ${overdueOrders.length ? "urgent" : reminders.length ? "" : "cleared"}"><div class="alert-banner-content">${icon(overdueOrders.length ? "triangle-alert" : reminders.length ? "bell-ring" : "circle-check", 18)}<div><strong>${overdueOrders.length ? `有 ${overdueOrders.length} 笔逾期账款需要立即处理` : reminders.length ? `有 ${reminders.length} 笔账款需要处理` : "当前提醒已处理完成"}</strong><span>${urgentOrder ? `${escapeHtml(urgentOrder.partnerName)} · ${escapeHtml(urgentOrder.orderNo)} · ${urgentOrder.direction === "receivable" ? "应收" : "应付"} ${moneyMarkup(urgentOrder.outstandingCents, urgentOrder.currency)}` : reminders.length ? "处理后可在提醒中心确认或调整下次提醒时间。" : "新账款进入提醒窗口后会自动显示。"}</span></div></div>${reminders.length ? `<button class="text-button" data-view="reminders">查看提醒 ${icon("arrow-up-right", 13)}</button>` : ""}</div>
     ${planned.length ? `<section class="pending-deliveries"><div class="panel-header"><div><h2>待确认交货</h2><span>计划日期不会自动触发结算</span></div><button class="text-button" data-view="orders">查看全部</button></div><div class="compact-order-list">${planned.slice(0, 4).map((order) => `<div class="compact-order"><div><strong dir="auto">${escapeHtml(order.partnerName)}</strong><span dir="auto">${escapeHtml(order.orderNo)} · 计划 ${escapeHtml(formatDate(order.plannedDeliveryDate))}</span></div><div class="compact-order-actions"><b>${moneyMarkup(order.totalCents, order.currency)}</b>${actionButtons(order, true)}</div></div>`).join("")}</div></section>` : ""}
     <div class="panel-grid"><section class="panel"><div class="panel-header"><div><h2>客户应收</h2><span>已交货且尚未收清</span></div><button class="text-button" data-view="receivable">查看全部 ${icon("arrow-up-right", 13)}</button></div><div class="ledger-list">${renderLedgerRows("receivable", 4)}</div></section><section class="panel"><div class="panel-header"><div><h2>供应商应付</h2><span>已收货且尚未付清</span></div><button class="text-button" data-view="payable">查看全部 ${icon("arrow-up-right", 13)}</button></div><div class="ledger-list">${renderLedgerRows("payable", 4)}</div></section></div>
@@ -1751,7 +1794,7 @@ function renderAll() {
 function renderAccountingView() {
   const view = byId("view-accounting");
   if (!view || !state.data) return;
-  view.innerHTML = `<div class="view-heading"><div><p class="eyebrow">ACCOUNTING BOOKS</p><h1>财务账簿</h1><p>订单和收付款会自动形成可审计的会计分录，普通操作不需要选择借贷。</p></div><div class="heading-actions"><button class="outline-button" data-action="load-accounting">${icon("refresh-cw")}刷新账簿</button></div></div><section class="panel accounting-intro"><div class="panel-header"><div><h2>自动记账已开启</h2><span>交货确认生成应收/应付，收付款生成银行日记账；凭证仅追加，不覆盖历史。</span></div><span class="status-badge settled">小企业会计准则模板</span></div><div class="accounting-summary"><div><strong>主账币种</strong><span>CNY 人民币</span></div><div><strong>当前期间</strong><span id="accountingPeriodSummary">正在读取</span></div><div><strong>凭证状态</strong><span>自动生成，财务可复核</span></div></div></section><section class="panel accounting-panel"><div class="panel-header"><div><h2>账簿入口</h2><span>先提供最常用的明细账与结账入口，复杂科目由财务维护。</span></div></div><div class="accounting-tiles"><button class="accounting-tile" data-action="load-accounting"><span>${icon("book-open",22)}</span><strong>会计明细账</strong><small>查看每笔自动生成凭证</small></button><button class="accounting-tile" data-action="load-accounting"><span>${icon("landmark",22)}</span><strong>银行日记账</strong><small>收付款按资金账户留痕</small></button><button class="accounting-tile" data-action="load-accounting"><span>${icon("calendar-check",22)}</span><strong>月末结账</strong><small>关闭期间后禁止补录</small></button></div><div id="accountingData" class="accounting-data"><div class="audit-empty">${icon("loader-circle",22)}<span>正在读取账簿</span></div></div></section>`;
+  view.innerHTML = `<div class="view-heading"><div><p class="eyebrow">ACCOUNTING BOOKS</p><h1>财务账簿</h1><p>订单和收付款会自动形成可审计的会计分录，普通操作不需要选择借贷。</p></div><div class="heading-actions"><button class="outline-button" data-action="load-accounting">${icon("refresh-cw")}刷新账簿</button></div></div><section class="panel accounting-intro"><div class="panel-header"><div><h2>自动记账已开启</h2><span>交货确认生成应收/应付，收付款生成银行日记账；凭证仅追加，不覆盖历史。</span></div><span class="status-badge settled">小企业会计准则模板</span></div><div class="accounting-summary"><div><strong>主账币种</strong><span>CNY 人民币</span></div><div><strong>当前期间</strong><span id="accountingPeriodSummary">正在读取</span></div><div><strong>凭证状态</strong><span>自动生成，财务可复核</span></div></div></section><section class="panel accounting-panel"><div class="panel-header"><div><h2>账簿与报表</h2><span>业务人员看台账，财务人员看结果；同一笔订单自动保留完整链路。</span></div></div><div class="accounting-tiles"><button class="accounting-tile" data-action="load-accounting"><span>${icon("book-open",22)}</span><strong>会计明细账</strong><small>查看每笔自动生成凭证</small></button><button class="accounting-tile" data-action="load-accounting"><span>${icon("landmark",22)}</span><strong>银行日记账</strong><small>收付款按资金账户留痕</small></button><button class="accounting-tile" data-action="load-accounting"><span>${icon("calendar-check",22)}</span><strong>月末结账</strong><small>关闭期间后禁止补录</small></button></div><div id="accountingData" class="accounting-data"><div class="audit-empty">${icon("loader-circle",22)}<span>正在读取账簿</span></div></div></section>`;
   void loadAccountingData();
 }
 
@@ -1768,9 +1811,52 @@ async function loadAccountingData() {
     const current = periods[0];
     const summary = byId("accountingPeriodSummary");
     if (summary) summary.textContent = current ? `${current.start?.slice(0, 7)} · ${current.status === "closed" ? "已结账" : "开放"}` : "暂无期间";
-    target.innerHTML = journals.length ? `<div class="accounting-table-wrap"><table class="data-table"><thead><tr><th>凭证号</th><th>日期</th><th>摘要</th><th>借方</th><th>贷方</th><th>来源</th></tr></thead><tbody>${journals.map((journal) => { const lines = Array.isArray(journal.lines) ? journal.lines : []; const debit = lines.reduce((sum, line) => sum + Number(line.debitCents || 0), 0); const credit = lines.reduce((sum, line) => sum + Number(line.creditCents || 0), 0); return `<tr><td><strong>${escapeHtml(journal.voucherNo)}</strong></td><td>${escapeHtml(String(journal.postedAt || "").slice(0, 10))}</td><td>${escapeHtml(journal.description || "")}</td><td class="amount-cell">${formatMoney(debit, "CNY")}</td><td class="amount-cell">${formatMoney(credit, "CNY")}</td><td><span class="status-badge pending">自动</span></td></tr>`; }).join("")}</tbody></table></div>` : `<div class="audit-empty">${icon("book-open",22)}<span>还没有自动生成的凭证。确认一笔交货或收付款后，这里会出现账务结果。</span></div>`;
+    const accounts = state.data.accounting?.accounts || [];
+    const accountRows = accounts.filter((account) => Number(account.debitCents || account.creditCents || 0) > 0).map((account) => {
+      const debit = Number(account.debitCents || 0);
+      const credit = Number(account.creditCents || 0);
+      const normalSide = ["liability", "equity", "revenue"].includes(account.category) ? "credit" : "debit";
+      const balance = normalSide === "credit" ? credit - debit : debit - credit;
+      return `<tr><td><strong>${escapeHtml(account.code)}</strong></td><td>${escapeHtml(account.name)}</td><td class="amount-cell">${formatMoney(debit, "CNY")}</td><td class="amount-cell">${formatMoney(credit, "CNY")}</td><td class="amount-cell"><strong>${formatMoney(balance, "CNY")}</strong></td></tr>`;
+    }).join("");
+    const reportButtons = `<div class="accounting-report-links"><button class="outline-button small-button" data-action="load-accounting-report" data-report="trial-balance">${icon("scale",14)}试算平衡</button><button class="outline-button small-button" data-action="load-accounting-report" data-report="income-statement">${icon("chart-no-axes-combined",14)}利润表</button><button class="outline-button small-button" data-action="load-accounting-report" data-report="balance-sheet">${icon("landmark",14)}资产负债表</button><button class="outline-button small-button" data-action="load-accounting-report" data-report="aging">${icon("timer-reset",14)}应收应付账龄</button></div>`;
+    const accountTable = accountRows ? `<section class="accounting-subsection"><div class="subsection-heading"><div><h3>科目余额</h3><span>当前企业累计借贷发生额及余额方向</span></div></div><div class="accounting-table-wrap"><table class="data-table"><thead><tr><th>科目</th><th>名称</th><th>借方发生</th><th>贷方发生</th><th>余额</th></tr></thead><tbody>${accountRows}</tbody></table></div></section>` : "";
+    const journalTable = journals.length ? `<section class="accounting-subsection"><div class="subsection-heading"><div><h3>自动凭证</h3><span>交货、收付款和冲销均可追溯</span></div></div><div class="accounting-table-wrap"><table class="data-table"><thead><tr><th>凭证号</th><th>日期</th><th>摘要</th><th>借方</th><th>贷方</th><th>来源</th></tr></thead><tbody>${journals.map((journal) => { const lines = Array.isArray(journal.lines) ? journal.lines : []; const debit = lines.reduce((sum, line) => sum + Number(line.debitCents || 0), 0); const credit = lines.reduce((sum, line) => sum + Number(line.creditCents || 0), 0); return `<tr><td><strong>${escapeHtml(journal.voucherNo)}</strong></td><td>${escapeHtml(String(journal.postedAt || "").slice(0, 10))}</td><td>${escapeHtml(journal.description || "")}</td><td class="amount-cell">${formatMoney(debit, "CNY")}</td><td class="amount-cell">${formatMoney(credit, "CNY")}</td><td><span class="status-badge pending">自动</span></td></tr>`; }).join("")}</tbody></table></div></section>` : `<div class="audit-empty">${icon("book-open",22)}<span>还没有自动生成的凭证。确认一笔交货或收付款后，这里会出现账务结果。</span></div>`;
+    target.innerHTML = `${reportButtons}${accountTable}${journalTable}<div id="accountingReportResult"></div>`;
   } catch (error) {
     target.innerHTML = `<div class="audit-empty error">${icon("circle-alert",22)}<span>${escapeHtml(error.message || "账簿读取失败")}</span></div>`;
+  }
+}
+
+async function loadAccountingReport(report) {
+  const target = byId("accountingReportResult");
+  if (!target) return;
+  target.innerHTML = `<div class="audit-empty">${icon("loader-circle", 20)}<span>正在读取报表</span></div>`;
+  try {
+    const payload = await apiRequest(`/api/accounting/${report}`, { busyText: "正在读取财务报表" });
+    const moneyValue = (value) => formatMoney(Number(value || 0), "CNY");
+    if (report === "trial-balance") {
+      const rows = (payload.accounts || []).filter((account) => Number(account.debitCents || account.creditCents || 0) > 0).map((account) => `<tr><td><strong>${escapeHtml(account.code)}</strong></td><td>${escapeHtml(account.name)}</td><td class="amount-cell">${moneyValue(account.debitCents)}</td><td class="amount-cell">${moneyValue(account.creditCents)}</td><td class="amount-cell">${moneyValue(account.endingBalanceCents)}</td></tr>`).join("");
+      target.innerHTML = `<section class="accounting-report-result"><div class="subsection-heading"><div><h3>试算平衡表</h3><span>${payload.balanced ? "借贷平衡" : "存在差额，请联系财务复核"}</span></div><span class="status-badge ${payload.balanced ? "settled" : "overdue"}">${payload.balanced ? "已平衡" : "需复核"}</span></div><div class="accounting-table-wrap"><table class="data-table"><thead><tr><th>科目</th><th>名称</th><th>借方</th><th>贷方</th><th>余额</th></tr></thead><tbody>${rows || `<tr><td colspan="5">暂无发生额</td></tr>`}</tbody></table></div></section>`;
+      return;
+    }
+    if (report === "income-statement") {
+      const totals = payload.totals || {};
+      target.innerHTML = `<section class="accounting-report-result"><div class="subsection-heading"><div><h3>利润表</h3><span>收入、成本和费用按当前期间统计</span></div></div><div class="report-total-grid"><div><span>营业收入</span><strong class="green-text">${moneyValue(totals.revenueCents)}</strong></div><div><span>营业成本</span><strong>${moneyValue(totals.costCents)}</strong></div><div><span>期间费用</span><strong>${moneyValue(totals.expenseCents)}</strong></div><div><span>本期利润</span><strong class="${Number(totals.profitCents || 0) >= 0 ? "green-text" : "red-text"}">${moneyValue(totals.profitCents)}</strong></div></div></section>`;
+      return;
+    }
+    if (report === "balance-sheet") {
+      const totals = payload.totals || {};
+      target.innerHTML = `<section class="accounting-report-result"><div class="subsection-heading"><div><h3>资产负债表</h3><span>${payload.balanced ? "资产 = 负债 + 所有者权益" : "报表暂不平衡，请复核凭证"}</span></div><span class="status-badge ${payload.balanced ? "settled" : "overdue"}">${payload.balanced ? "已平衡" : "需复核"}</span></div><div class="report-total-grid"><div><span>资产合计</span><strong>${moneyValue(totals.assetCents)}</strong></div><div><span>负债合计</span><strong>${moneyValue(totals.liabilityCents)}</strong></div><div><span>所有者权益</span><strong>${moneyValue(totals.equityCents)}</strong></div><div><span>差额</span><strong class="${Number(totals.differenceCents || 0) === 0 ? "green-text" : "red-text"}">${moneyValue(totals.differenceCents)}</strong></div></div></section>`;
+      return;
+    }
+    if (report === "aging") {
+      const bucketLabels = { not_due: "未到期", "0_30": "逾期 0–30 天", "31_60": "31–60 天", "61_90": "61–90 天", "91_180": "91–180 天", "181_365": "181–365 天", over_365: "超过 365 天" };
+      const bucketRows = Object.entries(payload.buckets || {}).map(([bucket, value]) => `<tr><td>${bucketLabels[bucket] || bucket}</td><td class="amount-cell">${moneyValue(value)}</td></tr>`).join("");
+      target.innerHTML = `<section class="accounting-report-result"><div class="subsection-heading"><div><h3>应收应付账龄</h3><span>截至 ${escapeHtml(payload.asOfDate || "当前日期")}，不同币种暂不合并</span></div></div><div class="accounting-table-wrap"><table class="data-table"><thead><tr><th>账龄区间</th><th>未结金额</th></tr></thead><tbody>${bucketRows}</tbody></table></div></section>`;
+    }
+  } catch (error) {
+    target.innerHTML = `<div class="audit-empty error">${icon("circle-alert", 20)}<span>${escapeHtml(error.message || "报表读取失败")}</span></div>`;
   }
 }
 
@@ -2782,6 +2868,7 @@ function bindEvents() {
       if (type === "pending-notifications") showToast("微信、短信和电话通知服务待接入，不会模拟发送");
       if (type === "account-menu") setView("settings");
       if (type === "load-accounting") await loadAccountingData();
+      if (type === "load-accounting-report") await loadAccountingReport(action.dataset.report);
       if (type === "change-password") openPasswordModal();
       if (type === "refresh-audit") await loadAudit({ force: true });
       if (type === "refresh-members") await loadMembers({ force: true });
