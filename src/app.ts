@@ -15,6 +15,7 @@ import { normalizePhone } from "./lib/phone.js";
 import { hashSessionToken, newId, newSessionToken } from "./lib/security.js";
 import { rescheduleQueuedDailyDigests } from "./notifications/service.js";
 import { SmsProviderError, type SmsProvider } from "./sms/index.js";
+import { postFulfillmentJournal, postPaymentJournal, postPaymentReversalJournal } from "./accounting.js";
 
 const roleSchema = z.enum(["owner", "finance", "sales", "viewer"]);
 type Role = z.infer<typeof roleSchema>;
@@ -2597,8 +2598,8 @@ export function buildApp(options: AppOptions): FastifyInstance {
     const params = parse(z.object({ id: z.uuid() }), request.params);
     const input = parse(fulfillSchema, request.body ?? {});
     await database.transaction(async (tx) => {
-      const result = await tx.query<{ fulfillment_status: string; order_date: string; settlement_days: number; settlement_months: number }>(
-        `SELECT fulfillment_status, order_date::text, settlement_days, settlement_months FROM orders
+      const result = await tx.query<{ fulfillment_status: string; order_date: string; settlement_days: number; settlement_months: number; direction: "receivable" | "payable"; total_cents: string }>(
+        `SELECT fulfillment_status, order_date::text, settlement_days, settlement_months, direction, total_cents::text FROM orders
          WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
         [auth.tenantId, params.id],
       );
@@ -2628,6 +2629,14 @@ export function buildApp(options: AppOptions): FastifyInstance {
          WHERE tenant_id = $1 AND id = $2`,
         [auth.tenantId, params.id, fulfilledAt.toISOString(), dueAt.toISOString()],
       );
+      await postFulfillmentJournal(tx, {
+        tenantId: auth.tenantId,
+        orderId: params.id,
+        direction: order.direction,
+        amountCents: money(order.total_cents),
+        postedAt: fulfilledAt.toISOString(),
+        createdBy: auth.userId,
+      });
       const reminderId = newId();
       await tx.query(
         `INSERT INTO reminders (id, tenant_id, order_id, due_at, status)
@@ -2680,8 +2689,8 @@ export function buildApp(options: AppOptions): FastifyInstance {
         replayed = true;
         return;
       }
-      const orderResult = await tx.query<{ fulfillment_status: string; fulfilled_at: Date | string; total_cents: string }>(
-        `SELECT fulfillment_status, fulfilled_at, total_cents::text FROM orders
+      const orderResult = await tx.query<{ fulfillment_status: string; fulfilled_at: Date | string; total_cents: string; direction: "receivable" | "payable" }>(
+        `SELECT fulfillment_status, fulfilled_at, total_cents::text, direction FROM orders
          WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
         [auth.tenantId, params.id],
       );
@@ -2722,6 +2731,15 @@ export function buildApp(options: AppOptions): FastifyInstance {
           paidAt.toISOString(), input.note ?? null, input.proofKey ?? null,
           idempotencyKey, requestHash, auth.userId],
       );
+      await postPaymentJournal(tx, {
+        tenantId: auth.tenantId,
+        paymentId,
+        orderId: params.id,
+        direction: order.direction,
+        amountCents: input.amountCents,
+        postedAt: paidAt.toISOString(),
+        createdBy: auth.userId,
+      });
       const remainingCents = outstandingCents - input.amountCents;
       if (remainingCents === 0) {
         const closedReminders = await tx.query<{ id: string }>(
@@ -2820,8 +2838,9 @@ export function buildApp(options: AppOptions): FastifyInstance {
         fulfillment_status: string;
         total_cents: string;
         due_at: Date | string | null;
+        direction: "receivable" | "payable";
       }>(
-        `SELECT fulfillment_status, total_cents::text, due_at
+        `SELECT fulfillment_status, total_cents::text, due_at, direction
          FROM orders
          WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
         [auth.tenantId, paymentReference.order_id],
@@ -2879,6 +2898,16 @@ export function buildApp(options: AppOptions): FastifyInstance {
         reversedBy: auth.userId,
         reversedAt: iso(inserted.rows[0]?.reversed_at),
       };
+
+      await postPaymentReversalJournal(tx, {
+        tenantId: auth.tenantId,
+        reversalId,
+        paymentId: params.id,
+        direction: order.direction,
+        amountCents: money(payment.amount_cents),
+        postedAt: new Date(String(inserted.rows[0]?.reversed_at ?? new Date().toISOString())).toISOString(),
+        createdBy: auth.userId,
+      });
 
       if (order.fulfillment_status === "fulfilled"
           && preReversalPaidCents === money(order.total_cents)
@@ -3022,6 +3051,169 @@ export function buildApp(options: AppOptions): FastifyInstance {
         createdAt: iso(row.created_at),
       })),
     };
+  });
+
+  app.get("/api/accounting/accounts", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const result = await database.query(
+      `SELECT id, code, name, category, is_system, created_at
+       FROM accounting_accounts WHERE tenant_id = $1 ORDER BY code`,
+      [auth.tenantId],
+    );
+    return { accounts: result.rows.map((row) => ({
+      id: row.id, code: row.code, name: row.name, category: row.category,
+      system: row.is_system === true, createdAt: iso(row.created_at),
+    })) };
+  });
+
+  app.get("/api/accounting/journals", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const query = parse(z.object({ period: z.string().regex(/^\d{4}-\d{2}$/).optional(), limit: z.coerce.number().int().min(1).max(500).default(200) }), request.query);
+    const result = await database.query(
+      `SELECT j.id, j.entry_no, j.source_type, j.source_id, j.description,
+              j.entry_date, j.created_at, p.period_start::text,
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'accountCode', a.code, 'accountName', a.name, 'lineNo', line.line_no,
+                'description', line.description, 'debitCents', line.debit_cents::text, 'creditCents', line.credit_cents::text
+              ) ORDER BY line.line_no) FILTER (WHERE line.id IS NOT NULL), '[]'::jsonb) AS lines
+       FROM journal_entries j
+       JOIN accounting_periods p ON p.tenant_id = j.tenant_id AND p.id = j.period_id
+       LEFT JOIN journal_lines line ON line.tenant_id = j.tenant_id AND line.journal_entry_id = j.id
+       LEFT JOIN accounting_accounts a ON a.tenant_id = line.tenant_id AND a.id = line.account_id
+       WHERE j.tenant_id = $1 AND ($2::text IS NULL OR to_char(p.period_start, 'YYYY-MM') = $2)
+       GROUP BY j.id, p.period_start ORDER BY j.entry_date DESC, j.id DESC LIMIT $3`,
+      [auth.tenantId, query.period ?? null, query.limit],
+    );
+    return { journals: result.rows.map((row) => ({
+      id: row.id, voucherNo: String(row.entry_no), sourceType: row.source_type,
+      sourceId: row.source_id, description: row.description, postedAt: iso(row.entry_date),
+      period: dateOnly(row.period_start)?.slice(0, 7), lines: row.lines,
+    })) };
+  });
+
+  app.get("/api/accounting/ledger", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const query = parse(z.object({
+      accountCode: z.string().trim().max(32).optional(),
+      period: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).default(500),
+    }), request.query);
+    const result = await database.query(
+      `SELECT e.id, e.entry_no, e.entry_date::text, e.source_type, e.source_id,
+              e.description AS entry_description, line.line_no, line.description,
+              account.code AS account_code, account.name AS account_name,
+              line.debit_cents::text, line.credit_cents::text, line.currency,
+              partner.name AS partner_name, bank.name AS bank_account_name
+       FROM journal_entries e
+       JOIN journal_lines line ON line.tenant_id = e.tenant_id AND line.journal_entry_id = e.id
+       JOIN accounting_accounts account ON account.tenant_id = line.tenant_id AND account.id = line.account_id
+       LEFT JOIN partners partner ON partner.tenant_id = line.tenant_id AND partner.id = line.partner_id
+       LEFT JOIN bank_accounts bank ON bank.tenant_id = line.tenant_id AND bank.id = line.bank_account_id
+       WHERE e.tenant_id = $1
+         AND ($2::text IS NULL OR account.code = $2)
+         AND ($3::text IS NULL OR to_char(e.entry_date, 'YYYY-MM') = $3)
+       ORDER BY e.entry_date DESC, e.entry_no DESC, line.line_no
+       LIMIT $4`,
+      [auth.tenantId, query.accountCode ?? null, query.period ?? null, query.limit],
+    );
+    return { ledger: result.rows.map((row) => ({
+      id: row.id, entryNo: Number(row.entry_no), entryDate: dateOnly(row.entry_date),
+      sourceType: row.source_type, sourceId: row.source_id,
+      entryDescription: row.entry_description, lineNo: Number(row.line_no),
+      description: row.description, accountCode: row.account_code, accountName: row.account_name,
+      debitCents: money(row.debit_cents), creditCents: money(row.credit_cents), currency: row.currency,
+      partnerName: row.partner_name, bankAccountName: row.bank_account_name,
+    })) };
+  });
+
+  app.get("/api/accounting/bank-journal", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const query = parse(z.object({
+      bankAccountId: z.uuid().optional(),
+      period: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).default(500),
+    }), request.query);
+    const result = await database.query(
+      `SELECT line.id, e.entry_no, e.entry_date::text, e.source_type, e.source_id,
+              e.description AS entry_description, line.description,
+              bank.id AS bank_account_id, bank.name AS bank_account_name,
+              line.debit_cents::text, line.credit_cents::text, line.currency,
+              partner.name AS partner_name
+       FROM journal_entries e
+       JOIN journal_lines line ON line.tenant_id = e.tenant_id AND line.journal_entry_id = e.id
+       JOIN bank_accounts bank ON bank.tenant_id = line.tenant_id AND bank.id = line.bank_account_id
+       LEFT JOIN partners partner ON partner.tenant_id = line.tenant_id AND partner.id = line.partner_id
+       WHERE e.tenant_id = $1
+         AND ($2::uuid IS NULL OR bank.id = $2)
+         AND ($3::text IS NULL OR to_char(e.entry_date, 'YYYY-MM') = $3)
+       ORDER BY e.entry_date DESC, e.entry_no DESC, line.line_no
+       LIMIT $4`,
+      [auth.tenantId, query.bankAccountId ?? null, query.period ?? null, query.limit],
+    );
+    return { bankJournal: result.rows.map((row) => ({
+      id: row.id, entryNo: Number(row.entry_no), entryDate: dateOnly(row.entry_date),
+      sourceType: row.source_type, sourceId: row.source_id,
+      entryDescription: row.entry_description, description: row.description,
+      bankAccountId: row.bank_account_id, bankAccountName: row.bank_account_name,
+      debitCents: money(row.debit_cents), creditCents: money(row.credit_cents), currency: row.currency,
+      partnerName: row.partner_name,
+    })) };
+  });
+
+  app.get("/api/accounting/bank-accounts", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const result = await database.query(
+      `SELECT bank.id, bank.name, bank.account_type, bank.account_no, bank.currency,
+              bank.opening_balance_cents::text, bank.is_default, bank.is_active,
+              account.code AS account_code
+       FROM bank_accounts bank
+       JOIN accounting_accounts account ON account.tenant_id = bank.tenant_id AND account.id = bank.account_id
+       WHERE bank.tenant_id = $1 ORDER BY bank.is_active DESC, bank.is_default DESC, bank.name`,
+      [auth.tenantId],
+    );
+    return { bankAccounts: result.rows.map((row) => ({
+      id: row.id, name: row.name, type: row.account_type, accountNo: row.account_no,
+      currency: row.currency, openingBalanceCents: money(row.opening_balance_cents),
+      isDefault: row.is_default === true, isActive: row.is_active === true, accountCode: row.account_code,
+    })) };
+  });
+
+  app.get("/api/accounting/periods", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const result = await database.query(
+      `SELECT id, period_start::text, period_end::text, status, closed_at, closed_by
+       FROM accounting_periods WHERE tenant_id = $1 ORDER BY period_start DESC`, [auth.tenantId],
+    );
+    return { periods: result.rows.map((row) => ({
+      id: row.id, start: dateOnly(row.period_start), end: dateOnly(row.period_end), status: row.status,
+      closedAt: iso(row.closed_at), closedBy: row.closed_by,
+    })) };
+  });
+
+  app.post("/api/accounting/periods/:id/close", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance"]);
+    const params = parse(z.object({ id: z.uuid() }).strict(), request.params);
+    await database.transaction(async (tx) => {
+      const result = await tx.query<{ status: string }>(
+        `SELECT status FROM accounting_periods WHERE tenant_id = $1 AND id = $2 FOR UPDATE`, [auth.tenantId, params.id],
+      );
+      const period = result.rows[0];
+      if (!period) throw new ApiError(404, "ACCOUNTING_PERIOD_NOT_FOUND", "会计期间不存在");
+      if (period.status === "closed") return;
+      await tx.query(
+        `UPDATE accounting_periods SET status = 'closed', closed_at = now(), closed_by = $3 WHERE tenant_id = $1 AND id = $2`,
+        [auth.tenantId, params.id, auth.userId],
+      );
+      await writeAudit(tx, { tenantId: auth.tenantId, actorUserId: auth.userId, action: "accounting.period_closed", entityType: "accounting_period", entityId: params.id });
+    });
+    return { period: { id: params.id, status: "closed" } };
   });
 
   if (options.serveStatic) {

@@ -1,5 +1,6 @@
 import bcrypt from "bcryptjs";
 import type { Database } from "./db/types.js";
+import { ensureAccountingDefaults, postFulfillmentJournal, postPaymentJournal } from "./accounting.js";
 
 export const DEMO_IDS = {
   tenant: "11111111-1111-4111-8111-111111111111",
@@ -91,5 +92,14 @@ export async function seedDemo(database: Database): Promise<void> {
        ON CONFLICT (id) DO NOTHING`,
       [DEMO_IDS.tenant, DEMO_IDS.payableOrder],
     );
+    await ensureAccountingDefaults(tx, DEMO_IDS.tenant, "2026-07-18");
+    await postFulfillmentJournal(tx, {
+      tenantId: DEMO_IDS.tenant, orderId: DEMO_IDS.receivableOrder, direction: "receivable",
+      amountCents: 1280000, postedAt: "2026-07-10T02:00:00Z", createdBy: DEMO_IDS.user,
+    });
+    await postPaymentJournal(tx, {
+      tenantId: DEMO_IDS.tenant, paymentId: DEMO_IDS.payment, orderId: DEMO_IDS.receivableOrder,
+      direction: "receivable", amountCents: 300000, postedAt: "2026-07-18T03:00:00Z", createdBy: DEMO_IDS.user,
+    });
   });
 }

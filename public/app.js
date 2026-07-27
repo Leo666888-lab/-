@@ -81,6 +81,7 @@ const viewLabels = {
   receivable: "客户应收",
   payable: "供应商应付",
   orders: "全部订单",
+  accounting: "财务账簿",
   contacts: "客户/供应商",
   reminders: "提醒中心",
   imports: "导入数据",
@@ -1736,6 +1737,7 @@ function renderAll() {
   renderLedgerView("receivable");
   renderLedgerView("payable");
   renderOrdersView();
+  renderAccountingView();
   renderContactsView();
   renderRemindersView();
   renderImportView();
@@ -1744,6 +1746,32 @@ function renderAll() {
   updateNavigationCounts();
   setView(state.view, false);
   refreshIcons();
+}
+
+function renderAccountingView() {
+  const view = byId("view-accounting");
+  if (!view || !state.data) return;
+  view.innerHTML = `<div class="view-heading"><div><p class="eyebrow">ACCOUNTING BOOKS</p><h1>财务账簿</h1><p>订单和收付款会自动形成可审计的会计分录，普通操作不需要选择借贷。</p></div><div class="heading-actions"><button class="outline-button" data-action="load-accounting">${icon("refresh-cw")}刷新账簿</button></div></div><section class="panel accounting-intro"><div class="panel-header"><div><h2>自动记账已开启</h2><span>交货确认生成应收/应付，收付款生成银行日记账；凭证仅追加，不覆盖历史。</span></div><span class="status-badge settled">小企业会计准则模板</span></div><div class="accounting-summary"><div><strong>主账币种</strong><span>CNY 人民币</span></div><div><strong>当前期间</strong><span id="accountingPeriodSummary">正在读取</span></div><div><strong>凭证状态</strong><span>自动生成，财务可复核</span></div></div></section><section class="panel accounting-panel"><div class="panel-header"><div><h2>账簿入口</h2><span>先提供最常用的明细账与结账入口，复杂科目由财务维护。</span></div></div><div class="accounting-tiles"><button class="accounting-tile" data-action="load-accounting"><span>${icon("book-open",22)}</span><strong>会计明细账</strong><small>查看每笔自动生成凭证</small></button><button class="accounting-tile" data-action="load-accounting"><span>${icon("landmark",22)}</span><strong>银行日记账</strong><small>收付款按资金账户留痕</small></button><button class="accounting-tile" data-action="load-accounting"><span>${icon("calendar-check",22)}</span><strong>月末结账</strong><small>关闭期间后禁止补录</small></button></div><div id="accountingData" class="accounting-data"><div class="audit-empty">${icon("loader-circle",22)}<span>正在读取账簿</span></div></div></section>`;
+  void loadAccountingData();
+}
+
+async function loadAccountingData() {
+  const target = byId("accountingData");
+  if (!target || !state.data) return;
+  try {
+    const [journalsPayload, periodsPayload] = await Promise.all([
+      apiRequest("/api/accounting/journals?limit=80", { busyText: "正在读取会计账簿" }),
+      apiRequest("/api/accounting/periods", { busyText: "正在读取会计期间" })
+    ]);
+    const journals = Array.isArray(journalsPayload.journals) ? journalsPayload.journals : [];
+    const periods = Array.isArray(periodsPayload.periods) ? periodsPayload.periods : [];
+    const current = periods[0];
+    const summary = byId("accountingPeriodSummary");
+    if (summary) summary.textContent = current ? `${current.start?.slice(0, 7)} · ${current.status === "closed" ? "已结账" : "开放"}` : "暂无期间";
+    target.innerHTML = journals.length ? `<div class="accounting-table-wrap"><table class="data-table"><thead><tr><th>凭证号</th><th>日期</th><th>摘要</th><th>借方</th><th>贷方</th><th>来源</th></tr></thead><tbody>${journals.map((journal) => { const lines = Array.isArray(journal.lines) ? journal.lines : []; const debit = lines.reduce((sum, line) => sum + Number(line.debitCents || 0), 0); const credit = lines.reduce((sum, line) => sum + Number(line.creditCents || 0), 0); return `<tr><td><strong>${escapeHtml(journal.voucherNo)}</strong></td><td>${escapeHtml(String(journal.postedAt || "").slice(0, 10))}</td><td>${escapeHtml(journal.description || "")}</td><td class="amount-cell">${formatMoney(debit, "CNY")}</td><td class="amount-cell">${formatMoney(credit, "CNY")}</td><td><span class="status-badge pending">自动</span></td></tr>`; }).join("")}</tbody></table></div>` : `<div class="audit-empty">${icon("book-open",22)}<span>还没有自动生成的凭证。确认一笔交货或收付款后，这里会出现账务结果。</span></div>`;
+  } catch (error) {
+    target.innerHTML = `<div class="audit-empty error">${icon("circle-alert",22)}<span>${escapeHtml(error.message || "账簿读取失败")}</span></div>`;
+  }
 }
 
 function updateNavigationCounts() {
@@ -2753,6 +2781,7 @@ function bindEvents() {
       if (type === "open-snooze") openSnoozeModal(action.dataset.reminderId);
       if (type === "pending-notifications") showToast("微信、短信和电话通知服务待接入，不会模拟发送");
       if (type === "account-menu") setView("settings");
+      if (type === "load-accounting") await loadAccountingData();
       if (type === "change-password") openPasswordModal();
       if (type === "refresh-audit") await loadAudit({ force: true });
       if (type === "refresh-members") await loadMembers({ force: true });

@@ -16,7 +16,7 @@ describe("migration integrity", () => {
       const applied = await database.query<{ name: string; checksum: string }>(
         "SELECT name, checksum FROM schema_migrations ORDER BY name",
       );
-      expect(applied.rows).toHaveLength(9);
+      expect(applied.rows).toHaveLength(10);
       expect(applied.rows.every((row) => row.checksum.trim().length === 64)).toBe(true);
 
       for (const name of (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql"))) {
@@ -105,7 +105,7 @@ describe("migration integrity", () => {
       expect(tenant.rows[0]?.timezone).toBe("Asia/Shanghai");
       expect(Number(partner.rows[0]?.version)).toBe(1);
       expect(userColumns.rowCount).toBe(1);
-      expect(migrations.rows).toHaveLength(9);
+      expect(migrations.rows).toHaveLength(10);
       expect(migrations.rows.every((row) => row.checksum.trim().length === 64)).toBe(true);
 
       await expect(database.query(
