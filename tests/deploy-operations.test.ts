@@ -121,6 +121,13 @@ describe("deployment identity and secret isolation", () => {
     expect(preflight).toContain("fake notification worker and heartbeat timer must remain inactive and disabled in production");
     expect(preflight).not.toMatch(/redis-cli[^\n]*(?:-u|--uri)/);
     expect(preflight).not.toMatch(/(?:printf|echo)[^\n]*(?:redis_url|REDIS_URL|password)/i);
+    expect(preflight).toContain('DATABASE_URL="${database_url}" "${NODE_BIN}" "${parser_path}"');
+    expect(preflight).not.toContain('PGDATABASE="${DATABASE_URL}"');
+    expect(preflight).not.toContain('PGDATABASE="${ENV_VALUE}"');
+
+    const workerHealth = readRepositoryFile("deploy/scripts/siyan-settlement-666-reminder-worker-health-check.sh");
+    expect(workerHealth).toContain('DATABASE_URL="${DATABASE_URL}" "${NODE_BIN}" "${DATABASE_URL_PARSER}"');
+    expect(workerHealth).not.toContain('PGDATABASE="${DATABASE_URL}"');
   });
 
   it("passes Redis credentials through the child environment and rejects plaintext Redis", () => {

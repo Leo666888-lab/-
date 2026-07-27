@@ -74,7 +74,7 @@ if [[ "${mode}" == "upgrade" && "${confirmed_empty}" == true ]]; then
   die "--confirm-empty-database is only valid for first install"
 fi
 
-for command_name in awk date getent grep id nginx psql readlink redis-cli runuser sha256sum ss stat systemctl tr; do
+for command_name in awk date getent grep id mktemp nginx psql readlink redis-cli rm runuser sha256sum ss stat systemctl tr; do
   command -v "${command_name}" >/dev/null 2>&1 || die "required command not found: ${command_name}"
 done
 
@@ -124,6 +124,74 @@ read_bounded_integer() {
   local parsed_value=$((10#${ENV_VALUE}))
   (( parsed_value >= minimum && parsed_value <= maximum )) \
     || die "${key} must be between ${minimum} and ${maximum}"
+}
+
+# Parse a PostgreSQL URL into libpq environment variables without putting the
+# password in argv or in the preflight output. The parser emits NUL-delimited
+# pairs so passwords and URL-encoded values cannot be split by shell syntax.
+load_postgres_connection() {
+  local database_url="$1"
+  local parse_status=0
+  local connection_key
+  local connection_value
+  local expected_key
+  local -a connection_keys=()
+  local parser_path="${release_dir}/deploy/scripts/parse-postgres-database-url.mjs"
+
+  [[ -r "${parser_path}" ]] || die "database URL parser is missing"
+  POSTGRES_CONNECTION_ENV_PATH="$(mktemp "${TMPDIR:-/tmp}/siyan-settlement-666-pg.XXXXXX")"
+  DATABASE_URL="${database_url}" "${NODE_BIN}" "${parser_path}" > "${POSTGRES_CONNECTION_ENV_PATH}" || parse_status=$?
+  unset database_url
+  if (( parse_status != 0 )); then
+    rm -f -- "${POSTGRES_CONNECTION_ENV_PATH}"
+    POSTGRES_CONNECTION_ENV_PATH=""
+    die "DATABASE_URL could not be parsed"
+  fi
+
+  unset PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE \
+    PGSSLMODE PGSSLCERT PGSSLKEY PGSSLROOTCERT PGSSLCRL PGSSLCRLDIR \
+    PGSSLSNI PGSSLPASSWORD PGREQUIREPEER PGCONNECT_TIMEOUT \
+    PGTARGETSESSIONATTRS PGCHANNELBINDING PGOPTIONS
+  exec 8<"${POSTGRES_CONNECTION_ENV_PATH}"
+  while :; do
+    connection_key=""
+    if ! IFS= read -r -d '' connection_key <&8; then
+      [[ -z "${connection_key}" ]] || die "database URL parser returned incomplete output"
+      break
+    fi
+    IFS= read -r -d '' connection_value <&8 || die "database URL parser returned incomplete output"
+    case "${connection_key}" in
+      PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|PGSSLMODE|PGSSLCERT|PGSSLKEY|PGSSLROOTCERT|PGSSLCRL|PGSSLCRLDIR|PGSSLSNI|PGSSLPASSWORD|PGREQUIREPEER|PGCONNECT_TIMEOUT|PGTARGETSESSIONATTRS|PGCHANNELBINDING|PGOPTIONS) ;;
+      *) die "database URL parser returned an unsupported connection option" ;;
+    esac
+    for expected_key in "${connection_keys[@]}"; do
+      [[ "${expected_key}" != "${connection_key}" ]] || die "database URL parser returned a duplicate connection option"
+    done
+    printf -v "${connection_key}" '%s' "${connection_value}"
+    export "${connection_key}"
+    connection_keys+=("${connection_key}")
+  done
+  exec 8<&-
+  rm -f -- "${POSTGRES_CONNECTION_ENV_PATH}"
+  POSTGRES_CONNECTION_ENV_PATH=""
+  for expected_key in PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE; do
+    [[ -n "${!expected_key:-}" ]] || die "database URL parser returned incomplete connection details"
+  done
+}
+
+POSTGRES_CONNECTION_ENV_PATH=""
+cleanup_postgres_connection_file() {
+  if [[ -n "${POSTGRES_CONNECTION_ENV_PATH}" && -e "${POSTGRES_CONNECTION_ENV_PATH}" ]]; then
+    rm -f -- "${POSTGRES_CONNECTION_ENV_PATH}"
+  fi
+}
+trap cleanup_postgres_connection_file EXIT
+
+unset_postgres_connection() {
+  unset PGHOST PGPORT PGUSER PGPASSWORD PGDATABASE \
+    PGSSLMODE PGSSLCERT PGSSLKEY PGSSLROOTCERT PGSSLCRL PGSSLCRLDIR \
+    PGSSLSNI PGSSLPASSWORD PGREQUIREPEER PGCONNECT_TIMEOUT \
+    PGTARGETSESSIONATTRS PGCHANNELBINDING PGOPTIONS
 }
 
 validate_env_keys() {
@@ -408,14 +476,15 @@ try {
   fail();
 }
 NODE
-unset app_database_url backup_database_url backup_remote alert_webhook_url \
+unset backup_remote alert_webhook_url \
   redis_url redis_key_prefix release_id sms_enabled notification_provider notification_worker_name \
   notification_unit ENV_VALUE
 
+load_postgres_connection "${backup_database_url}"
+
 role_access_state="$(
-  PGDATABASE="$(read_env_value "${BACKUP_ENV}" DATABASE_URL; printf '%s' "${ENV_VALUE}")" \
-    psql --no-psqlrc --no-password --tuples-only --no-align --set ON_ERROR_STOP=1 \
-      --command="BEGIN READ ONLY;
+  psql --no-psqlrc --no-password --tuples-only --no-align --set ON_ERROR_STOP=1 \
+    --command="BEGIN READ ONLY;
         SELECT concat_ws(':',
           role.rolsuper,
           role.rolcreatedb,
@@ -459,6 +528,7 @@ role_access_state="$(
         WHERE role.rolname = current_user;
         COMMIT;"
 )" || die "backup database role safety query failed"
+unset_postgres_connection
 role_access_state="$(printf '%s\n' "${role_access_state}" \
   | awk -F: '/^[ft]:[ft]:[ft]:[ft]:[ft]:[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+$/ { print; exit }')"
 [[ "${role_access_state}" == "f:f:f:f:f:0:0:0:0:0:0" ]] \
@@ -472,11 +542,12 @@ if [[ "${mode}" == "first-install" ]]; then
   if ss -lntH | awk '$4 ~ /(^|\])127\.0\.0\.1:16666$/ || $4 == "127.0.0.1:16666" { found=1 } END { exit !found }'; then
     die "internal port 16666 is already in use"
   fi
-  read_env_value "${APP_ENV}" DATABASE_URL
+  load_postgres_connection "${app_database_url}"
   table_count="$(
-    PGDATABASE="${ENV_VALUE}" psql --no-psqlrc --no-password --tuples-only --no-align --set ON_ERROR_STOP=1 \
+    psql --no-psqlrc --no-password --tuples-only --no-align --set ON_ERROR_STOP=1 \
       --command="BEGIN READ ONLY; SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema'); COMMIT;"
   )" || die "read-only empty database check failed"
+  unset_postgres_connection
   table_count="$(printf '%s\n' "${table_count}" | awk '/^[0-9]+$/ { print; exit }')"
   [[ "${table_count}" == "0" ]] || die "first-install target database is not empty"
 else
@@ -496,6 +567,9 @@ else
   (( now_epoch - backup_epoch <= 129600 )) || die "latest verified offsite backup is older than 36 hours"
   "${release_dir}/deploy/scripts/siyan-settlement-666-health-check.sh" --all
 fi
+
+unset_postgres_connection
+unset app_database_url backup_database_url
 
 nginx -t
 nginx_configuration="$(nginx -T 2>&1)" || die "nginx -T failed"
