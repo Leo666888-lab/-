@@ -95,11 +95,12 @@ export async function seedDemo(database: Database): Promise<void> {
     await ensureAccountingDefaults(tx, DEMO_IDS.tenant, "2026-07-18");
     await postFulfillmentJournal(tx, {
       tenantId: DEMO_IDS.tenant, orderId: DEMO_IDS.receivableOrder, direction: "receivable",
-      amountCents: 1280000, postedAt: "2026-07-10T02:00:00Z", createdBy: DEMO_IDS.user,
+      amountCents: 1280000, postedAt: "2026-07-10T02:00:00Z", createdBy: DEMO_IDS.user, currency: "CNY",
     });
     await postPaymentJournal(tx, {
       tenantId: DEMO_IDS.tenant, paymentId: DEMO_IDS.payment, orderId: DEMO_IDS.receivableOrder,
       direction: "receivable", amountCents: 300000, postedAt: "2026-07-18T03:00:00Z", createdBy: DEMO_IDS.user,
+      currency: "CNY",
     });
   });
 }

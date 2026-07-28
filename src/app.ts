@@ -16,7 +16,13 @@ import { hashSessionToken, newId, newSessionToken } from "./lib/security.js";
 import { rescheduleQueuedDailyDigests } from "./notifications/service.js";
 import { SmsProviderError, type SmsProvider } from "./sms/index.js";
 import { postFulfillmentJournal, postPaymentJournal, postPaymentReversalJournal } from "./accounting.js";
-import { getAgingReport, getBalanceSheet, getIncomeStatement, getTrialBalance } from "./accounting-reports.js";
+import {
+  getAgingReport,
+  getBalanceSheet,
+  getCashFlowStatement,
+  getIncomeStatement,
+  getTrialBalance,
+} from "./accounting-reports.js";
 
 const roleSchema = z.enum(["owner", "finance", "sales", "viewer"]);
 type Role = z.infer<typeof roleSchema>;
@@ -1800,12 +1806,13 @@ export function buildApp(options: AppOptions): FastifyInstance {
          FROM accounting_accounts account
          LEFT JOIN journal_lines line
            ON line.tenant_id = account.tenant_id AND line.account_id = account.id
+          AND btrim(line.currency) = 'CNY'
          LEFT JOIN journal_entries entry
            ON entry.tenant_id = line.tenant_id AND entry.id = line.journal_entry_id
-         WHERE account.tenant_id = $1 AND account.is_active = true
+         WHERE account.tenant_id = $1 AND account.is_active = true AND $2::boolean = true
          GROUP BY account.code, account.name, account.category
          ORDER BY account.code`,
-        [auth.tenantId],
+        [auth.tenantId, ["owner", "finance", "viewer"].includes(auth.role)],
       ),
     ]);
     return {
@@ -2625,8 +2632,8 @@ export function buildApp(options: AppOptions): FastifyInstance {
     const params = parse(z.object({ id: z.uuid() }), request.params);
     const input = parse(fulfillSchema, request.body ?? {});
     await database.transaction(async (tx) => {
-      const result = await tx.query<{ fulfillment_status: string; order_date: string; settlement_days: number; settlement_months: number; direction: "receivable" | "payable"; total_cents: string }>(
-        `SELECT fulfillment_status, order_date::text, settlement_days, settlement_months, direction, total_cents::text FROM orders
+      const result = await tx.query<{ fulfillment_status: string; order_date: string; settlement_days: number; settlement_months: number; direction: "receivable" | "payable"; total_cents: string; currency: string }>(
+        `SELECT fulfillment_status, order_date::text, settlement_days, settlement_months, direction, total_cents::text, currency FROM orders
          WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
         [auth.tenantId, params.id],
       );
@@ -2663,6 +2670,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
         amountCents: money(order.total_cents),
         postedAt: fulfilledAt.toISOString(),
         createdBy: auth.userId,
+        currency: order.currency,
       });
       const reminderId = newId();
       await tx.query(
@@ -2716,8 +2724,8 @@ export function buildApp(options: AppOptions): FastifyInstance {
         replayed = true;
         return;
       }
-      const orderResult = await tx.query<{ fulfillment_status: string; fulfilled_at: Date | string; total_cents: string; direction: "receivable" | "payable" }>(
-        `SELECT fulfillment_status, fulfilled_at, total_cents::text, direction FROM orders
+      const orderResult = await tx.query<{ fulfillment_status: string; fulfilled_at: Date | string; total_cents: string; direction: "receivable" | "payable"; currency: string }>(
+        `SELECT fulfillment_status, fulfilled_at, total_cents::text, direction, currency FROM orders
          WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
         [auth.tenantId, params.id],
       );
@@ -2766,6 +2774,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
         amountCents: input.amountCents,
         postedAt: paidAt.toISOString(),
         createdBy: auth.userId,
+        currency: order.currency,
       });
       const remainingCents = outstandingCents - input.amountCents;
       if (remainingCents === 0) {
@@ -2866,8 +2875,9 @@ export function buildApp(options: AppOptions): FastifyInstance {
         total_cents: string;
         due_at: Date | string | null;
         direction: "receivable" | "payable";
+        currency: string;
       }>(
-        `SELECT fulfillment_status, total_cents::text, due_at, direction
+        `SELECT fulfillment_status, total_cents::text, due_at, direction, currency
          FROM orders
          WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
         [auth.tenantId, paymentReference.order_id],
@@ -2934,6 +2944,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
         amountCents: money(payment.amount_cents),
         postedAt: new Date(String(inserted.rows[0]?.reversed_at ?? new Date().toISOString())).toISOString(),
         createdBy: auth.userId,
+        currency: order.currency,
       });
 
       if (order.fulfillment_status === "fulfilled"
@@ -3099,11 +3110,12 @@ export function buildApp(options: AppOptions): FastifyInstance {
     requireRole(auth, ["owner", "finance", "viewer"]);
     const query = parse(z.object({ period: z.string().regex(/^\d{4}-\d{2}$/).optional(), limit: z.coerce.number().int().min(1).max(500).default(200) }), request.query);
     const result = await database.query(
-      `SELECT j.id, j.entry_no, j.source_type, j.source_id, j.description,
+      `SELECT j.id, j.entry_no, j.source_type, j.source_id, j.description, j.currency,
               j.entry_date, j.created_at, p.period_start::text,
               COALESCE(jsonb_agg(jsonb_build_object(
                 'accountCode', a.code, 'accountName', a.name, 'lineNo', line.line_no,
-                'description', line.description, 'debitCents', line.debit_cents::text, 'creditCents', line.credit_cents::text
+                'description', line.description, 'debitCents', line.debit_cents::text,
+                'creditCents', line.credit_cents::text, 'currency', line.currency
               ) ORDER BY line.line_no) FILTER (WHERE line.id IS NOT NULL), '[]'::jsonb) AS lines
        FROM journal_entries j
        JOIN accounting_periods p ON p.tenant_id = j.tenant_id AND p.id = j.period_id
@@ -3116,7 +3128,7 @@ export function buildApp(options: AppOptions): FastifyInstance {
     return { journals: result.rows.map((row) => ({
       id: row.id, voucherNo: String(row.entry_no), sourceType: row.source_type,
       sourceId: row.source_id, description: row.description, postedAt: iso(row.entry_date),
-      period: dateOnly(row.period_start)?.slice(0, 7), lines: row.lines,
+      period: dateOnly(row.period_start)?.slice(0, 7), currency: String(row.currency).trim(), lines: row.lines,
     })) };
   });
 
@@ -3244,6 +3256,13 @@ export function buildApp(options: AppOptions): FastifyInstance {
     return getBalanceSheet(database, auth.tenantId, query.period);
   });
 
+  app.get("/api/accounting/cash-flow-statement", async (request) => {
+    const auth = await authenticate(database, request, publicOrigin);
+    requireRole(auth, ["owner", "finance", "viewer"]);
+    const query = parse(z.object({ period: z.string().optional() }).strict(), request.query);
+    return getCashFlowStatement(database, auth.tenantId, query.period);
+  });
+
   app.get("/api/accounting/aging", async (request) => {
     const auth = await authenticate(database, request, publicOrigin);
     requireRole(auth, ["owner", "finance", "viewer"]);
@@ -3256,12 +3275,34 @@ export function buildApp(options: AppOptions): FastifyInstance {
     requireRole(auth, ["owner", "finance"]);
     const params = parse(z.object({ id: z.uuid() }).strict(), request.params);
     await database.transaction(async (tx) => {
-      const result = await tx.query<{ status: string }>(
-        `SELECT status FROM accounting_periods WHERE tenant_id = $1 AND id = $2 FOR UPDATE`, [auth.tenantId, params.id],
+      const result = await tx.query<{ status: string; period_start: string }>(
+        `SELECT status, period_start::text FROM accounting_periods
+         WHERE tenant_id = $1 AND id = $2 FOR UPDATE`, [auth.tenantId, params.id],
       );
       const period = result.rows[0];
       if (!period) throw new ApiError(404, "ACCOUNTING_PERIOD_NOT_FOUND", "会计期间不存在");
       if (period.status === "closed") return;
+      const periodName = String(period.period_start).slice(0, 7);
+      const trialBalance = await getTrialBalance(tx, auth.tenantId, periodName);
+      if (!trialBalance.balanced) {
+        throw new ApiError(409, "ACCOUNTING_PERIOD_UNBALANCED", "当前期间借贷不平，不能结账", {
+          period: periodName,
+          differenceCents: trialBalance.totals.differenceCents,
+        });
+      }
+      const incompleteBusiness = await tx.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+           FROM journal_entries
+          WHERE tenant_id = $1 AND period_id = $2 AND source_type = 'order.fulfillment'`,
+        [auth.tenantId, params.id],
+      );
+      const incompleteBusinessCount = Number.parseInt(incompleteBusiness.rows[0]?.count ?? "0", 10);
+      if (incompleteBusinessCount > 0) {
+        throw new ApiError(409, "ACCOUNTING_PERIOD_PREREQUISITES_INCOMPLETE", "原始凭证、审批和成本结转尚未完成，不能结账", {
+          period: periodName,
+          affectedJournals: incompleteBusinessCount,
+        });
+      }
       await tx.query(
         `UPDATE accounting_periods SET status = 'closed', closed_at = now(), closed_by = $3 WHERE tenant_id = $1 AND id = $2`,
         [auth.tenantId, params.id, auth.userId],

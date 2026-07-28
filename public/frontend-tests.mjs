@@ -165,19 +165,36 @@ test("validates money, custom terms, and role permissions", () => {
   assert.equal(roleCan("owner", "closePeriod"), true);
   assert.equal(roleCan("finance", "closePeriod"), true);
   assert.equal(roleCan("viewer", "closePeriod"), false);
+  assert.equal(roleCan("owner", "readAccounting"), true);
+  assert.equal(roleCan("viewer", "readAccounting"), true);
+  assert.equal(roleCan("sales", "readAccounting"), false);
 });
 
 test("routes accounting tiles to dedicated books and period closing", () => {
   assert.match(appSource, /data-action="load-accounting-section" data-section="ledger"/);
   assert.match(appSource, /data-action="load-accounting-section" data-section="bank-journal"/);
-  assert.match(appSource, /data-action="load-accounting-section" data-section="period-close"/);
-  assert.match(appSource, /apiRequest\("\/api\/accounting\/ledger\?limit=500"/);
+  assert.match(indexSource, /data-view="period-close"/);
+  assert.match(appSource, /apiRequest\(`\/api\/accounting\/ledger\?limit=500\$\{query\}`/);
   assert.match(appSource, /apiRequest\("\/api\/accounting\/bank-journal\?limit=500"/);
+  assert.match(appSource, /cash-flow-statement/);
   assert.match(appSource, /apiRequest\(`\/api\/accounting\/periods\/\$\{encodeURIComponent\(periodId\)\}\/close`/);
   assert.match(appSource, /window\.confirm\(/);
   assert.match(appSource, /function revealAccountingTarget/);
   assert.match(appSource, /target\.scrollIntoView\(\{ behavior: "smooth", block \}\)/);
   assert.match(appSource, /revealAccountingTarget\(target, "start"\)/);
+});
+
+test("keeps voucher currencies visible and blocks unsafe CNY account aggregation", () => {
+  assert.match(appSource, /const currency = journal\.currency \|\| lines\.find\(\(line\) => line\.currency\)\?\.currency \|\| "CNY"/);
+  assert.match(appSource, /const lineCurrency = line\.currency \|\| currency/);
+  assert.match(appSource, /formatMoney\(debit, currency\)/);
+  assert.match(appSource, /formatMoney\(Number\(line\.debitCents\), lineCurrency\)/);
+  assert.match(appSource, /formatMoney\(Number\(line\.creditCents\), lineCurrency\)/);
+  assert.match(appSource, /<td>\$\{escapeHtml\(lineCurrency\)\}<\/td>/);
+  assert.match(appSource, /const foreignFulfilledCount = state\.data\.orders\.filter\(\(order\) => order\.fulfillmentStatus === "fulfilled" && order\.currency !== "CNY"\)\.length/);
+  assert.match(appSource, /const accountTable = foreignFulfilledCount\s*\n\s*\? `<section class="capability-status danger accounting-currency-warning"/);
+  assert.match(appSource, /本位币科目汇总已暂停展示/);
+  assert.match(appSource, /不会把外币发生额并入 CNY 科目余额/);
 });
 
 test("uses the enterprise timezone for date and datetime-local values", () => {
@@ -279,16 +296,16 @@ test("is CSP-friendly and self-hosts visual dependencies", () => {
 
 test("keeps the responsive commercial UI and keyboard accessibility contracts", () => {
   assert.match(indexSource, /name="theme-color" content="#ff6900"/);
-  assert.match(indexSource, /<title>思燕结算台｜思燕家居<\/title>/);
+  assert.match(indexSource, /<title>思燕智能财务｜思燕家居<\/title>/);
   assert.equal((indexSource.match(/思燕家居/g) || []).length, 3);
-  assert.match(indexSource, /<h1>思燕结算台<\/h1>/);
+  assert.match(indexSource, /<h1>思燕智能财务<\/h1>/);
   assert.equal((indexSource.match(/src="\.\/assets\/siyan-mark\.png"/g) || []).length, 3);
   assert.match(indexSource, /id="workspaceAvatar"[^>]*><i data-lucide="building-2"><\/i><\/span>/);
   assert.doesNotMatch(appSource, /workspaceAvatar"\)\.textContent/);
   assert.match(appSource, /workspaceIdentity"\)\.setAttribute\("aria-label", `当前企业：\$\{tenant\.name\}`\)/);
   assert.match(stylesSource, /\.workspace-switch > div > span/);
   assert.doesNotMatch(stylesSource, /\.workspace-switch span\s*\{/);
-  assert.match(indexSource, /data-view="orders"><i data-lucide="file-text"/);
+  assert.match(indexSource, /data-view="orders"><i data-lucide="notebook-tabs"/);
   assert.match(appSource, /orderFilters:\s*\{\s*direction:/);
   assert.match(appSource, /\["awaiting","未开始"\]/);
   assert.doesNotMatch(appSource, /\["pending","未开始"\]/);
@@ -304,6 +321,50 @@ test("keeps the responsive commercial UI and keyboard accessibility contracts", 
   assert.match(stylesSource, /\.commercial-lines \{ min-width: 0; \}/);
   assert.match(stylesSource, /@media \(prefers-reduced-motion: reduce\)/);
   assert.doesNotMatch(`${indexSource}\n${appSource}\n${stylesSource}`, /\uFFFD/);
+});
+
+test("exposes the order-driven finance workflow with honest capability states", () => {
+  for (const view of ["evidence", "approvals", "inventory", "checks", "balances", "auxiliary", "reports", "tax", "period-close", "automation"]) {
+    assert.match(indexSource, new RegExp(`id="view-${view}"`));
+    assert.match(appSource, new RegExp(`${view}:|"${view}"`));
+  }
+  assert.match(appSource, /function orderBusinessChainMarkup/);
+  assert.match(appSource, /function renderOrderImpactPreview/);
+  assert.match(appSource, /原始凭证.*待接入/);
+  assert.match(appSource, /审批状态机尚未接入/);
+  assert.match(appSource, /当前为订单交收数量预览/);
+  assert.match(appSource, /原始数据保护已开启/);
+  assert.match(appSource, /cash-flow-statement/);
+  assert.match(appSource, /所得税申报草稿/);
+  assert.match(appSource, /function ledgerSourceOrderId/);
+  assert.match(appSource, /点击订单号可回到业务单据和收付款记录/);
+  assert.match(appSource, /查看银行日记账/);
+  assert.match(appSource, /账面利润只用于流程演示，不作为完整经营或纳税结论/);
+  assert.match(appSource, /销售成本结转、费用报销、工资、折旧和税费计提尚未接入/);
+  assert.match(appSource, /\["block", "原始凭证完整性"/);
+  assert.match(appSource, /\["block", "审批完整性"/);
+  assert.match(appSource, /\["block", "折旧、摊销与成本结转"/);
+  assert.match(stylesSource, /\.business-chain/);
+  assert.match(stylesSource, /\.capability-status/);
+  assert.match(stylesSource, /\.risk-check-row/);
+  assert.match(stylesSource, /\.nav-item\.role-hidden/);
+  assert.doesNotMatch(`${indexSource}\n${appSource}`, /凭证上传成功|审批已通过|库存已同步/);
+});
+
+test("keeps foreign-currency accounting visible without unsafe base-currency totals", () => {
+  assert.match(appSource, /const currency = journal\.currency \|\| lines\.find\(\(line\) => line\.currency\)\?\.currency \|\| "CNY"/);
+  assert.match(appSource, /const lineCurrency = line\.currency \|\| currency/);
+  assert.match(appSource, /formatMoney\(Number\(line\.debitCents\), lineCurrency\)/);
+  assert.match(appSource, /本位币科目汇总已暂停展示/);
+  assert.match(appSource, /class="capability-status-actions"><button class="outline-button small-button" data-view="checks">查看风险/);
+
+  const periodCloseSource = appSource.slice(
+    appSource.indexOf("async function loadPeriodCloseView"),
+    appSource.indexOf("function renderAll"),
+  );
+  assert.match(periodCloseSource, /foreign\s*\? Promise\.resolve\(null\)\s*:\s*apiRequest\(`\/api\/accounting\/trial-balance/);
+  assert.match(periodCloseSource, /检测到外币业务，已跳过混币试算平衡请求/);
+  assert.match(periodCloseSource, /foreign \? "block" : balancePayload\?\.balanced/);
 });
 
 test("locks asynchronous submission modals until their request finishes", () => {
@@ -373,7 +434,7 @@ test("renders server-backed import, local-only OCR, and partner master-detail co
   assert.match(appSource, /data-import-mapping/);
   assert.match(appSource, /data-import-row/);
   assert.match(appSource, /download-import-template/);
-  assert.match(appSource, /思燕结算台-订单导入模板\.csv/);
+  assert.match(appSource, /思燕智能财务-订单导入模板\.csv/);
   assert.match(appSource, /Excel 导入[\s\S]*CSV \/ XLSX 安全解析、字段映射、校验和审计已启用/);
   assert.match(appSource, /纸单 OCR[\s\S]*等待阿里云 OCR 与对象存储服务开通/);
   assert.doesNotMatch(appSource, /accept="[^"]*\.xls(?:,|\")/);

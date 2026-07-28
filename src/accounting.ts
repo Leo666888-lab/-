@@ -28,14 +28,33 @@ async function accountId(tx: Queryable, tenantId: string, code: string): Promise
   return result.rows[0].id;
 }
 
-async function defaultBankAccountId(tx: Queryable, tenantId: string): Promise<string | null> {
+async function defaultBankAccountId(tx: Queryable, tenantId: string, currency: string): Promise<string | null> {
   const result = await tx.query<{ id: string }>(
     `SELECT id FROM bank_accounts
-     WHERE tenant_id = $1 AND is_active = true
+     WHERE tenant_id = $1 AND is_active = true AND currency = $2
      ORDER BY is_default DESC, name, id LIMIT 1`,
-    [tenantId],
+    [tenantId, currency],
   );
   return result.rows[0]?.id ?? null;
+}
+
+async function validateBankAccount(
+  tx: Queryable,
+  tenantId: string,
+  bankAccountId: string,
+  currency: string,
+): Promise<void> {
+  const result = await tx.query<{ currency: string; is_active: boolean }>(
+    `SELECT currency, is_active FROM bank_accounts
+     WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, bankAccountId],
+  );
+  const account = result.rows[0];
+  if (!account) throw new ApiError(409, "BANK_ACCOUNT_NOT_FOUND", "指定的银行账户不存在或不属于当前企业");
+  if (!account.is_active) throw new ApiError(409, "BANK_ACCOUNT_INACTIVE", "指定的银行账户已停用");
+  if (String(account.currency).trim() !== currency) {
+    throw new ApiError(409, "BANK_ACCOUNT_CURRENCY_MISMATCH", "银行账户币种与凭证币种不一致");
+  }
 }
 
 export async function postJournal(tx: Queryable, input: {
@@ -87,7 +106,20 @@ export async function postJournal(tx: Queryable, input: {
   const entryNo = Number(entryNoResult.rows[0]?.entry_no ?? 0) + 1;
   const entryId = newId();
   const entryDate = input.postedAt.slice(0, 10);
-  const currency = input.currency ?? "CNY";
+  const currency = String(input.currency ?? "CNY").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new ApiError(400, "INVALID_CURRENCY", "凭证币种必须是三位字母代码");
+  }
+  const fallbackBankId = input.lines.some((line) => line.accountCode === "1002" && line.bankAccountId === undefined)
+    ? await defaultBankAccountId(tx, input.tenantId, currency)
+    : null;
+  if (input.lines.some((line) => line.accountCode === "1002" && !line.bankAccountId) && !fallbackBankId) {
+    throw new ApiError(409, "BANK_ACCOUNT_CURRENCY_UNAVAILABLE", `没有可用的 ${currency} 银行账户，无法登记收付款`);
+  }
+  for (const line of input.lines) {
+    const lineBankId = line.bankAccountId ?? (line.accountCode === "1002" ? fallbackBankId : null);
+    if (lineBankId) await validateBankAccount(tx, input.tenantId, lineBankId, currency);
+  }
   await tx.query(
     `INSERT INTO journal_entries
        (id, tenant_id, period_id, entry_no, entry_date, source_type, source_id,
@@ -96,9 +128,6 @@ export async function postJournal(tx: Queryable, input: {
     [entryId, input.tenantId, periodRow.id, entryNo, entryDate, input.sourceType, input.sourceId,
       input.description, currency, totalDebit, totalCredit, input.createdBy],
   );
-  const fallbackBankId = input.lines.some((line) => line.accountCode === "1002" && line.bankAccountId === undefined)
-    ? await defaultBankAccountId(tx, input.tenantId)
-    : null;
   let lineNo = 1;
   for (const line of input.lines) {
     const lineBankId = line.bankAccountId ?? (line.accountCode === "1002" ? fallbackBankId : null);
@@ -117,6 +146,8 @@ export async function postJournal(tx: Queryable, input: {
 
 export async function postFulfillmentJournal(tx: Queryable, input: {
   tenantId: string; orderId: string; direction: Direction; amountCents: number; postedAt: string; createdBy: string;
+  /** Currency is optional for backwards-compatible internal callers; API paths always pass the order currency. */
+  currency?: string;
 }) {
   const isReceivable = input.direction === "receivable";
   return postJournal(tx, {
@@ -126,6 +157,7 @@ export async function postFulfillmentJournal(tx: Queryable, input: {
     sourceId: input.orderId,
     description: isReceivable ? "确认销售收入及应收账款" : "确认采购入库及应付账款",
     createdBy: input.createdBy,
+    currency: input.currency,
     lines: isReceivable
       ? [{ accountCode: "1122", debitCents: input.amountCents }, { accountCode: "5001", creditCents: input.amountCents }]
       : [{ accountCode: "1405", debitCents: input.amountCents }, { accountCode: "2202", creditCents: input.amountCents }],
@@ -134,6 +166,8 @@ export async function postFulfillmentJournal(tx: Queryable, input: {
 
 export async function postPaymentJournal(tx: Queryable, input: {
   tenantId: string; paymentId: string; orderId: string; direction: Direction; amountCents: number; postedAt: string; createdBy: string;
+  /** Currency is optional for backwards-compatible internal callers; API paths always pass the order currency. */
+  currency?: string;
 }) {
   const isReceivable = input.direction === "receivable";
   return postJournal(tx, {
@@ -143,6 +177,7 @@ export async function postPaymentJournal(tx: Queryable, input: {
     sourceId: input.paymentId,
     description: isReceivable ? "收到客户货款" : "支付供应商货款",
     createdBy: input.createdBy,
+    currency: input.currency,
     lines: isReceivable
       ? [{ accountCode: "1002", debitCents: input.amountCents }, { accountCode: "1122", creditCents: input.amountCents }]
       : [{ accountCode: "2202", debitCents: input.amountCents }, { accountCode: "1002", creditCents: input.amountCents }],
@@ -151,6 +186,8 @@ export async function postPaymentJournal(tx: Queryable, input: {
 
 export async function postPaymentReversalJournal(tx: Queryable, input: {
   tenantId: string; reversalId: string; paymentId: string; direction: Direction; amountCents: number; postedAt: string; createdBy: string;
+  /** Currency is optional for backwards-compatible internal callers; API paths always pass the order currency. */
+  currency?: string;
 }) {
   const isReceivable = input.direction === "receivable";
   return postJournal(tx, {
@@ -160,6 +197,7 @@ export async function postPaymentReversalJournal(tx: Queryable, input: {
     sourceId: input.reversalId,
     description: isReceivable ? "冲销客户收款" : "冲销供应商付款",
     createdBy: input.createdBy,
+    currency: input.currency,
     lines: isReceivable
       ? [{ accountCode: "1122", debitCents: input.amountCents }, { accountCode: "1002", creditCents: input.amountCents }]
       : [{ accountCode: "1002", debitCents: input.amountCents }, { accountCode: "2202", creditCents: input.amountCents }],

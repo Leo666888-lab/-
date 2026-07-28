@@ -299,6 +299,17 @@ describe.sequential("commercial settlement API", () => {
     expect(recentPayment.orderNo).toBeTruthy();
   });
 
+  it("does not expose accounting balances to sales users in bootstrap", async () => {
+    const [ownerResponse, salesResponse] = await Promise.all([
+      app.inject({ method: "GET", url: "/api/bootstrap", headers: auth(ownerToken) }),
+      app.inject({ method: "GET", url: "/api/bootstrap", headers: auth(salesToken) }),
+    ]);
+    expect(ownerResponse.statusCode).toBe(200);
+    expect(ownerResponse.json().accounting.accounts.length).toBeGreaterThan(0);
+    expect(salesResponse.statusCode).toBe(200);
+    expect(salesResponse.json().accounting.accounts).toEqual([]);
+  });
+
   it("returns 404 instead of leaking another tenant's order", async () => {
     const login = await app.inject({
       method: "POST",
@@ -1120,6 +1131,20 @@ describe.sequential("commercial settlement API", () => {
   });
 
   it("round-trips Chinese, English, and Arabic and keeps partner balances separated by currency", async () => {
+    const beforeBootstrap = await app.inject({ method: "GET", url: "/api/bootstrap", headers: auth(ownerToken) });
+    expect(beforeBootstrap.statusCode).toBe(200);
+    const cnyAccountingBefore = beforeBootstrap.json().accounting.accounts.map((account: {
+      code: string;
+      debitCents: number;
+      creditCents: number;
+      balanceCents: number;
+    }) => ({
+      code: account.code,
+      debitCents: account.debitCents,
+      creditCents: account.creditCents,
+      balanceCents: account.balanceCents,
+    }));
+
     const created = await app.inject({
       method: "POST",
       url: "/api/orders",
@@ -1158,6 +1183,34 @@ describe.sequential("commercial settlement API", () => {
     });
     expect(customer.balances.some((balance: { currency: string }) => balance.currency === "CNY")).toBe(true);
     expect(bootstrap.json().reminders.some((item: { orderId: string }) => item.orderId === created.json().order.id)).toBe(false);
+
+    const cnyAccountingAfter = bootstrap.json().accounting.accounts.map((account: {
+      code: string;
+      debitCents: number;
+      creditCents: number;
+      balanceCents: number;
+    }) => ({
+      code: account.code,
+      debitCents: account.debitCents,
+      creditCents: account.creditCents,
+      balanceCents: account.balanceCents,
+    }));
+    expect(cnyAccountingAfter).toEqual(cnyAccountingBefore);
+
+    const foreignJournalLines = await database.query<{ entry_currency: string; line_currency: string }>(
+      `SELECT btrim(entry.currency) AS entry_currency, btrim(line.currency) AS line_currency
+       FROM journal_entries entry
+       JOIN journal_lines line
+         ON line.tenant_id = entry.tenant_id
+        AND line.journal_entry_id = entry.id
+       WHERE entry.tenant_id = $1
+         AND entry.source_type = 'order.fulfillment'
+         AND entry.source_id = $2
+       ORDER BY line.line_no`,
+      [DEMO_IDS.tenant, created.json().order.id],
+    );
+    expect(foreignJournalLines.rows).toHaveLength(2);
+    expect(foreignJournalLines.rows.every((row) => row.entry_currency === "USD" && row.line_currency === "USD")).toBe(true);
   });
 
   it("creates and lists partners through both partners and contacts routes", async () => {

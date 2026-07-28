@@ -23,6 +23,161 @@ interface AccountMovement extends Record<string, unknown> {
   ending_credit_cents: string;
 }
 
+interface CashOpeningRow extends Record<string, unknown> {
+  currency: string;
+  opening_balance_cents: string;
+}
+
+interface CashMovementRow extends Record<string, unknown> {
+  currency: string;
+  prior_debit_cents: string;
+  prior_credit_cents: string;
+  period_debit_cents: string;
+  period_credit_cents: string;
+  operating_inflow_cents: string;
+  operating_outflow_cents: string;
+}
+
+const BASE_CURRENCY = "CNY";
+
+interface CurrencyRow extends Record<string, unknown> {
+  currency: string;
+}
+
+/**
+ * The first-stage ledger stores original cents but does not yet store an FX
+ * rate/base-currency amount. Aggregating a non-CNY journal with CNY would be
+ * mathematically valid JavaScript but financially wrong, so the report APIs
+ * fail closed until the currency conversion layer is configured.
+ */
+async function ensureBaseCurrencyReportSafe(
+  database: Queryable,
+  tenantId: string,
+  bounds: AccountingPeriodBounds,
+): Promise<string> {
+  await ensureEntryCurrencyConsistency(database, tenantId, bounds);
+
+  const result = await database.query<CurrencyRow>(
+    `SELECT DISTINCT currency
+       FROM (
+         SELECT btrim(entry.currency)::text AS currency
+           FROM journal_entries entry
+          WHERE entry.tenant_id = $1
+            AND ($2::date IS NULL OR entry.entry_date <= $2::date)
+         UNION
+         SELECT btrim(line.currency)::text AS currency
+           FROM journal_entries entry
+           JOIN journal_lines line
+             ON line.tenant_id = entry.tenant_id AND line.journal_entry_id = entry.id
+          WHERE entry.tenant_id = $1
+            AND ($2::date IS NULL OR entry.entry_date <= $2::date)
+         UNION
+         SELECT btrim(o.currency)::text AS currency
+           FROM orders o
+          WHERE o.tenant_id = $1
+            AND o.fulfillment_status = 'fulfilled'
+            AND ($2::date IS NULL OR o.fulfilled_at < ($2::date + interval '1 day'))
+         UNION
+         SELECT btrim(bank.currency)::text AS currency
+           FROM bank_accounts bank
+          WHERE bank.tenant_id = $1 AND bank.opening_balance_cents <> 0
+       ) currencies
+      WHERE currency <> ''
+      ORDER BY currency`,
+    [tenantId, bounds.endDate],
+  );
+  const currencies = result.rows.map((row) => String(row.currency).trim()).filter(Boolean);
+  const unsupported = currencies.filter((currency) => currency !== BASE_CURRENCY);
+  if (unsupported.length) {
+    throw new ApiError(409, "FOREIGN_CURRENCY_REPORT_UNAVAILABLE", "外币尚未完成汇率和本位币折算，已阻止生成可能混币的报表", {
+      currencyUnsafe: true,
+      baseCurrency: BASE_CURRENCY,
+      currencies,
+      unsupportedCurrencies: unsupported,
+    });
+  }
+  return BASE_CURRENCY;
+}
+
+async function ensureEntryCurrencyConsistency(
+  database: Queryable,
+  tenantId: string,
+  bounds: AccountingPeriodBounds,
+): Promise<void> {
+  const mismatch = await database.query(
+    `SELECT entry.currency AS entry_currency, line.currency AS line_currency,
+            bank.currency AS bank_currency
+       FROM journal_entries entry
+       JOIN journal_lines line
+         ON line.tenant_id = entry.tenant_id AND line.journal_entry_id = entry.id
+       LEFT JOIN bank_accounts bank
+         ON bank.tenant_id = line.tenant_id AND bank.id = line.bank_account_id
+      WHERE entry.tenant_id = $1
+        AND ($2::date IS NULL OR entry.entry_date <= $2::date)
+        AND (btrim(entry.currency) <> btrim(line.currency)
+             OR (bank.id IS NOT NULL AND btrim(bank.currency) <> btrim(line.currency)))
+      LIMIT 1`,
+    [tenantId, bounds.endDate],
+  );
+  if (mismatch.rowCount) {
+    const row = mismatch.rows[0];
+    if (!row) throw new ApiError(409, "ACCOUNTING_CURRENCY_MISMATCH", "凭证币种数据异常，已阻止生成报表", { currencyUnsafe: true });
+    throw new ApiError(409, "ACCOUNTING_CURRENCY_MISMATCH", "凭证、分录与资金账户的币种不一致，已阻止生成报表", {
+      currencyUnsafe: true,
+      entryCurrency: String(row.entry_currency ?? "").trim(),
+      lineCurrency: String(row.line_currency ?? "").trim(),
+      bankCurrency: row.bank_currency ? String(row.bank_currency).trim() : null,
+    });
+  }
+}
+
+async function ensureJournalSourceCurrenciesSafe(
+  database: Queryable,
+  tenantId: string,
+  bounds: AccountingPeriodBounds,
+): Promise<void> {
+  const result = await database.query(
+    `SELECT entry.currency AS entry_currency,
+            COALESCE(fulfillment_order.currency, payment_order.currency, reversal_order.currency) AS source_currency,
+            entry.source_type
+       FROM journal_entries entry
+       LEFT JOIN orders fulfillment_order
+         ON entry.source_type = 'order.fulfillment'
+        AND fulfillment_order.tenant_id = entry.tenant_id
+        AND fulfillment_order.id = entry.source_id
+       LEFT JOIN payments payment
+         ON entry.source_type = 'payment'
+        AND payment.tenant_id = entry.tenant_id
+        AND payment.id = entry.source_id
+       LEFT JOIN orders payment_order
+         ON payment_order.tenant_id = payment.tenant_id AND payment_order.id = payment.order_id
+       LEFT JOIN payment_reversals reversal
+         ON entry.source_type = 'payment.reversal'
+        AND reversal.tenant_id = entry.tenant_id
+        AND reversal.id = entry.source_id
+       LEFT JOIN orders reversal_order
+         ON reversal_order.tenant_id = reversal.tenant_id AND reversal_order.id = reversal.order_id
+      WHERE entry.tenant_id = $1
+        AND ($2::date IS NULL OR entry.entry_date <= $2::date)
+        AND COALESCE(fulfillment_order.currency, payment_order.currency, reversal_order.currency) IS NOT NULL
+        AND btrim(entry.currency) <> btrim(COALESCE(
+          fulfillment_order.currency, payment_order.currency, reversal_order.currency
+        ))
+      LIMIT 1`,
+    [tenantId, bounds.endDate],
+  );
+  if (result.rowCount) {
+    const row = result.rows[0];
+    if (!row) return;
+    throw new ApiError(409, "ACCOUNTING_SOURCE_CURRENCY_MISMATCH", "自动凭证与来源订单币种不一致，已阻止生成报表", {
+      currencyUnsafe: true,
+      sourceType: row.source_type,
+      entryCurrency: String(row.entry_currency ?? "").trim(),
+      sourceCurrency: String(row.source_currency ?? "").trim(),
+    });
+  }
+}
+
 function cents(value: unknown): number {
   const parsed = Number(value ?? 0);
   if (!Number.isSafeInteger(parsed)) throw new ApiError(500, "UNSAFE_MONEY_VALUE", "报表金额超出安全范围");
@@ -30,9 +185,11 @@ function cents(value: unknown): number {
 }
 
 function add(values: number[]): number {
-  const result = values.reduce((sum, value) => sum + value, 0);
-  if (!Number.isSafeInteger(result)) throw new ApiError(500, "UNSAFE_MONEY_VALUE", "报表金额超出安全范围");
-  return result;
+  return values.reduce((sum, value) => {
+    const result = sum + value;
+    if (!Number.isSafeInteger(result)) throw new ApiError(500, "UNSAFE_MONEY_VALUE", "报表金额超出安全范围");
+    return result;
+  }, 0);
 }
 
 function isoDateUtc(date: Date): string {
@@ -140,6 +297,8 @@ export async function getTrialBalance(
   period?: string,
 ) {
   const bounds = resolveAccountingPeriod(period);
+  const currency = await ensureBaseCurrencyReportSafe(database, tenantId, bounds);
+  await ensureJournalSourceCurrenciesSafe(database, tenantId, bounds);
   const movements = await accountMovements(database, tenantId, bounds);
   const accounts = movements.map(mapMovement);
   const totals = {
@@ -154,6 +313,8 @@ export async function getTrialBalance(
     period: bounds.period,
     startDate: bounds.startDate,
     endDate: bounds.endDate,
+    currency,
+    currencyUnsafe: false,
     accounts,
     totals: {
       ...totals,
@@ -175,6 +336,8 @@ export async function getIncomeStatement(
   period?: string,
 ) {
   const bounds = resolveAccountingPeriod(period);
+  const currency = await ensureBaseCurrencyReportSafe(database, tenantId, bounds);
+  await ensureJournalSourceCurrenciesSafe(database, tenantId, bounds);
   const movements = await accountMovements(database, tenantId, bounds);
   const lines = movements
     .filter((row) => row.category === "revenue" || row.category === "cost" || row.category === "expense")
@@ -193,6 +356,8 @@ export async function getIncomeStatement(
     period: bounds.period,
     startDate: bounds.startDate,
     endDate: bounds.endDate,
+    currency,
+    currencyUnsafe: false,
     lines,
     revenue: lines.filter((line) => line.category === "revenue"),
     costs: lines.filter((line) => line.category === "cost"),
@@ -207,6 +372,8 @@ export async function getBalanceSheet(
   period?: string,
 ) {
   const bounds = resolveAccountingPeriod(period);
+  const currency = await ensureBaseCurrencyReportSafe(database, tenantId, bounds);
+  await ensureJournalSourceCurrenciesSafe(database, tenantId, bounds);
   const movements = await accountMovements(database, tenantId, bounds);
   const lines = movements
     .filter((row) => row.category === "asset" || row.category === "liability" || row.category === "equity")
@@ -235,6 +402,8 @@ export async function getBalanceSheet(
   return {
     period: bounds.period,
     asOfDate: bounds.asOfDate,
+    currency,
+    currencyUnsafe: false,
     assets,
     liabilities,
     equity,
@@ -247,6 +416,115 @@ export async function getBalanceSheet(
       differenceCents: assetTotalCents - liabilityTotalCents - totalEquityCents,
     },
     balanced: assetTotalCents === liabilityTotalCents + totalEquityCents,
+  };
+}
+
+/**
+ * Build a direct-method cash flow statement from posted bank journal lines.
+ * Payment and payment-reversal journals are operating flows; any other bank
+ * journal source is kept visible as unclassified until a mapping rule exists.
+ */
+export async function getCashFlowStatement(
+  database: Queryable,
+  tenantId: string,
+  period?: string,
+) {
+  const bounds = resolveAccountingPeriod(period);
+  await ensureEntryCurrencyConsistency(database, tenantId, bounds);
+  await ensureJournalSourceCurrenciesSafe(database, tenantId, bounds);
+  const openingResult = await database.query<CashOpeningRow>(
+    `SELECT currency, COALESCE(SUM(opening_balance_cents), 0)::text AS opening_balance_cents
+       FROM bank_accounts
+      WHERE tenant_id = $1
+      GROUP BY currency
+      ORDER BY currency`,
+    [tenantId],
+  );
+  const movementResult = await database.query<CashMovementRow>(
+    `SELECT bank.currency,
+            COALESCE(SUM(CASE WHEN $2::date IS NOT NULL AND entry.entry_date < $2::date
+                              THEN line.debit_cents ELSE 0 END), 0)::text AS prior_debit_cents,
+            COALESCE(SUM(CASE WHEN $2::date IS NOT NULL AND entry.entry_date < $2::date
+                              THEN line.credit_cents ELSE 0 END), 0)::text AS prior_credit_cents,
+            COALESCE(SUM(CASE WHEN ($2::date IS NULL OR entry.entry_date >= $2::date)
+                                   AND ($3::date IS NULL OR entry.entry_date < $3::date)
+                              THEN line.debit_cents ELSE 0 END), 0)::text AS period_debit_cents,
+            COALESCE(SUM(CASE WHEN ($2::date IS NULL OR entry.entry_date >= $2::date)
+                                   AND ($3::date IS NULL OR entry.entry_date < $3::date)
+                              THEN line.credit_cents ELSE 0 END), 0)::text AS period_credit_cents,
+            COALESCE(SUM(CASE WHEN ($2::date IS NULL OR entry.entry_date >= $2::date)
+                                   AND ($3::date IS NULL OR entry.entry_date < $3::date)
+                                   AND entry.source_type IN ('payment', 'payment.reversal')
+                              THEN line.debit_cents ELSE 0 END), 0)::text AS operating_inflow_cents,
+            COALESCE(SUM(CASE WHEN ($2::date IS NULL OR entry.entry_date >= $2::date)
+                                   AND ($3::date IS NULL OR entry.entry_date < $3::date)
+                                   AND entry.source_type IN ('payment', 'payment.reversal')
+                              THEN line.credit_cents ELSE 0 END), 0)::text AS operating_outflow_cents
+       FROM journal_entries entry
+       JOIN journal_lines line
+         ON line.tenant_id = entry.tenant_id AND line.journal_entry_id = entry.id
+       JOIN bank_accounts bank
+         ON bank.tenant_id = line.tenant_id AND bank.id = line.bank_account_id
+      WHERE entry.tenant_id = $1
+        AND ($3::date IS NULL OR entry.entry_date < $3::date)
+      GROUP BY bank.currency
+      ORDER BY bank.currency`,
+    [tenantId, bounds.startDate, bounds.endExclusive],
+  );
+
+  const openingByCurrency = new Map(openingResult.rows.map((row) => [row.currency, row]));
+  const movementByCurrency = new Map(movementResult.rows.map((row) => [row.currency, row]));
+  const currencyCodes = [...new Set([...openingByCurrency.keys(), ...movementByCurrency.keys()])].sort();
+  const currencies = currencyCodes.map((currency) => {
+    const opening = openingByCurrency.get(currency);
+    const movement = movementByCurrency.get(currency);
+    const configuredOpeningCents = cents(opening?.opening_balance_cents);
+    const priorInflowCents = cents(movement?.prior_debit_cents);
+    const priorOutflowCents = cents(movement?.prior_credit_cents);
+    const periodInflowCents = cents(movement?.period_debit_cents);
+    const periodOutflowCents = cents(movement?.period_credit_cents);
+    const operatingInflowCents = cents(movement?.operating_inflow_cents);
+    const operatingOutflowCents = cents(movement?.operating_outflow_cents);
+    const operatingNetCents = add([operatingInflowCents, -operatingOutflowCents]);
+    const unclassifiedInflowCents = add([periodInflowCents, -operatingInflowCents]);
+    const unclassifiedOutflowCents = add([periodOutflowCents, -operatingOutflowCents]);
+    const unclassifiedNetCents = add([unclassifiedInflowCents, -unclassifiedOutflowCents]);
+    const openingBalanceCents = add([configuredOpeningCents, priorInflowCents, -priorOutflowCents]);
+    const cashDifferenceCents = add([periodInflowCents, -periodOutflowCents]);
+    const endingBalanceCents = add([openingBalanceCents, cashDifferenceCents]);
+    const reconciliationDifferenceCents = add([
+      cashDifferenceCents,
+      -operatingNetCents,
+      -unclassifiedNetCents,
+    ]);
+    return {
+      currency,
+      operating: {
+        inflowCents: operatingInflowCents,
+        outflowCents: operatingOutflowCents,
+        netCents: operatingNetCents,
+      },
+      unclassified: {
+        inflowCents: unclassifiedInflowCents,
+        outflowCents: unclassifiedOutflowCents,
+        netCents: unclassifiedNetCents,
+      },
+      cash: {
+        openingBalanceCents,
+        endingBalanceCents,
+        differenceCents: cashDifferenceCents,
+      },
+      reconciliationDifferenceCents,
+      reconciled: reconciliationDifferenceCents === 0,
+    };
+  });
+  return {
+    period: bounds.period,
+    startDate: bounds.startDate,
+    endDate: bounds.endDate,
+    currencies,
+    currencyUnsafe: false,
+    reconciled: currencies.every((currency) => currency.reconciled),
   };
 }
 
@@ -280,6 +558,8 @@ export async function getAgingReport(
   period?: string,
 ) {
   const bounds = resolveAccountingPeriod(period);
+  const currency = await ensureBaseCurrencyReportSafe(database, tenantId, bounds);
+  await ensureJournalSourceCurrenciesSafe(database, tenantId, bounds);
   const cutoff = bounds.endDate;
   const result = await database.query<AgingOrderRow>(
     `WITH paid AS (
@@ -349,6 +629,8 @@ export async function getAgingReport(
   return {
     period: bounds.period,
     asOfDate: bounds.asOfDate,
+    currency,
+    currencyUnsafe: false,
     buckets,
     byDirection,
     totalCents: add(orders.map((order) => order.outstandingCents)),

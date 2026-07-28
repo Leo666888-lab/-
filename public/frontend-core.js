@@ -293,6 +293,7 @@ export function roleCan(role, action) {
     correctOrder: ["owner", "finance", "sales"],
     reminder: ["owner", "finance", "sales"],
     partner: ["owner", "finance", "sales"],
+    readAccounting: ["owner", "finance", "viewer"],
     closePeriod: ["owner", "finance"]
   };
   return (permissions[action] ?? []).includes(role);
