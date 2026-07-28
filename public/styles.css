@@ -1496,11 +1496,13 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px
 .accounting-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 16px; border-bottom: 1px solid var(--line); }
 .accounting-tile { display: grid; gap: 5px; justify-items: start; padding: 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); text-align: left; cursor: pointer; transition: border-color .18s ease, background .18s ease; }
 .accounting-tile:hover { border-color: var(--accent); background: var(--surface-soft); }
+.accounting-tile.active { border-color: var(--accent); background: var(--surface-soft); }
 .accounting-tile > span { display: grid; place-items: center; width: 34px; height: 34px; color: var(--accent); background: var(--accent-soft); border-radius: 7px; }
 .accounting-tile strong { font-size: 14px; }
 .accounting-tile small { color: var(--muted); font-size: 12px; }
 .accounting-data { padding: 0 16px 16px; }
 .accounting-table-wrap { overflow-x: auto; }
+.accounting-section-result .table-subtext { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
 .accounting-subsection, .accounting-report-result { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 16px; }
 .subsection-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .subsection-heading h3 { margin: 0; font-size: 15px; }

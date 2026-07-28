@@ -162,6 +162,22 @@ test("validates money, custom terms, and role permissions", () => {
   assert.equal(roleCan("viewer", "cancelOrder"), false);
   assert.equal(roleCan("sales", "partner"), true);
   assert.equal(roleCan("viewer", "partner"), false);
+  assert.equal(roleCan("owner", "closePeriod"), true);
+  assert.equal(roleCan("finance", "closePeriod"), true);
+  assert.equal(roleCan("viewer", "closePeriod"), false);
+});
+
+test("routes accounting tiles to dedicated books and period closing", () => {
+  assert.match(appSource, /data-action="load-accounting-section" data-section="ledger"/);
+  assert.match(appSource, /data-action="load-accounting-section" data-section="bank-journal"/);
+  assert.match(appSource, /data-action="load-accounting-section" data-section="period-close"/);
+  assert.match(appSource, /apiRequest\("\/api\/accounting\/ledger\?limit=500"/);
+  assert.match(appSource, /apiRequest\("\/api\/accounting\/bank-journal\?limit=500"/);
+  assert.match(appSource, /apiRequest\(`\/api\/accounting\/periods\/\$\{encodeURIComponent\(periodId\)\}\/close`/);
+  assert.match(appSource, /window\.confirm\(/);
+  assert.match(appSource, /function revealAccountingTarget/);
+  assert.match(appSource, /target\.scrollIntoView\(\{ behavior: "smooth", block \}\)/);
+  assert.match(appSource, /revealAccountingTarget\(target, "start"\)/);
 });
 
 test("uses the enterprise timezone for date and datetime-local values", () => {
