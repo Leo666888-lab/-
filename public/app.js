@@ -277,6 +277,22 @@ function setAuthMode(mode, { focus = true } = {}) {
   if (focus) window.requestAnimationFrame(() => (smsMode ? smsPhone : passwordPhone).focus());
 }
 
+function configureEnvironmentUi() {
+  const localHostnames = new Set(["localhost", "127.0.0.1", "::1"]);
+  const isLocal = localHostnames.has(window.location.hostname);
+  const testAccountButton = byId("localTestAccountButton");
+  const loginNote = byId("loginNote");
+  if (testAccountButton) {
+    testAccountButton.classList.toggle("hidden", !isLocal);
+    testAccountButton.setAttribute("aria-hidden", String(!isLocal));
+  }
+  if (loginNote) {
+    loginNote.textContent = isLocal
+      ? "本地测试账号仅用于开发环境，不应带入线上环境。"
+      : "账号由企业管理员创建，登录会话采用安全令牌保护。";
+  }
+}
+
 function showLogin(errorMessage = "") {
   state.accountingRenderVersion += 1;
   state.financeRenderVersion += 1;
@@ -3833,6 +3849,7 @@ function bindEvents() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  configureEnvironmentUi();
   bindEvents();
   refreshIcons();
   const invitationToken = new URLSearchParams(window.location.search).get("invite") || "";

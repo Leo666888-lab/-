@@ -184,6 +184,13 @@ test("routes accounting tiles to dedicated books and period closing", () => {
   assert.match(appSource, /revealAccountingTarget\(target, "start"\)/);
 });
 
+test("keeps local test helpers out of the online login surface", () => {
+  assert.match(indexSource, /id="localTestAccountButton"[^>]+local-test-control hidden/);
+  assert.match(indexSource, /id="loginNote" class="login-note">账号由企业管理员创建/);
+  assert.match(appSource, /function configureEnvironmentUi\(\)/);
+  assert.match(appSource, /localHostnames = new Set\(\["localhost", "127\.0\.0\.1", "::1"\]\)/);
+});
+
 test("keeps voucher currencies visible and blocks unsafe CNY account aggregation", () => {
   assert.match(appSource, /const currency = journal\.currency \|\| lines\.find\(\(line\) => line\.currency\)\?\.currency \|\| "CNY"/);
   assert.match(appSource, /const lineCurrency = line\.currency \|\| currency/);

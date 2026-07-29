@@ -37,7 +37,7 @@
           <label>手机号<input id="loginPhone" type="tel" inputmode="tel" autocomplete="username" required /></label>
           <label>密码<input id="loginPassword" type="password" autocomplete="current-password" required /></label>
           <p id="loginError" class="form-error hidden" role="alert" aria-live="assertive"></p>
-          <div class="login-options"><span class="security-note"><i data-lucide="shield-check"></i>安全会话，不在浏览器长期保存密码或令牌</span><button class="text-button" type="button" data-action="fill-test-account">填入本地测试账号</button></div>
+          <div class="login-options"><span class="security-note"><i data-lucide="shield-check"></i>安全会话，不在浏览器长期保存密码或令牌</span><button id="localTestAccountButton" class="text-button local-test-control hidden" type="button" data-action="fill-test-account" aria-hidden="true">填入本地测试账号</button></div>
           <button id="loginSubmit" class="primary-button wide" type="submit"><i data-lucide="arrow-right"></i>进入智能财务</button>
         </form>
         <form id="smsLoginForm" class="login-form hidden" role="tabpanel" aria-labelledby="smsLoginTab">
@@ -62,7 +62,7 @@
           <p id="invitationError" class="form-error hidden" role="alert" aria-live="assertive"></p>
           <button id="invitationSubmit" class="primary-button wide" type="submit"><i data-lucide="user-check"></i>接受邀请并设置密码</button>
         </form>
-        <p id="loginNote" class="login-note">测试账号仅适用于本地种子数据，生产环境必须关闭测试数据。</p>
+        <p id="loginNote" class="login-note">账号由企业管理员创建，登录会话采用安全令牌保护。</p>
       </div>
     </section>
 
