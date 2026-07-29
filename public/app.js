@@ -2618,6 +2618,18 @@ function setSidebarOpen(open) {
   document.body.classList.toggle("nav-open", open);
 }
 
+function setDesktopSidebarCollapsed(collapsed) {
+  if (window.matchMedia("(max-width: 760px)").matches) return;
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  const toggle = byId("desktopSidebarToggle");
+  if (toggle) {
+    toggle.setAttribute("aria-label", collapsed ? "展开侧边栏" : "收起侧边栏");
+    toggle.setAttribute("title", collapsed ? "展开侧边栏" : "收起侧边栏");
+    toggle.innerHTML = icon(collapsed ? "panel-left-open" : "panel-left-close", 17);
+    refreshIcons();
+  }
+}
+
 const capabilityDetails = {
   "document-storage": ["正式原始凭证上传", "需要开通对象存储、文件安全扫描和 OCR 服务，再建立订单、附件、凭证之间的版本化绑定关系。当前本地预览不会上传或保存。", "cloud-upload"],
   "approval-engine": ["审批引擎", "需要新增审批实例、节点、条件、会签、转交和审计数据模型。接入前，系统不会把任何订单伪装成已审批。", "stamp"],
@@ -3530,6 +3542,7 @@ function bindEvents() {
   });
   byId("logoutButton").addEventListener("click", (event) => logout(event.currentTarget));
   byId("mobileMenu").addEventListener("click", () => setSidebarOpen(!byId("sidebar").classList.contains("open")));
+  byId("desktopSidebarToggle")?.addEventListener("click", () => setDesktopSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed")));
   byId("sidebarClose").addEventListener("click", () => setSidebarOpen(false));
   byId("sidebarScrim").addEventListener("click", () => setSidebarOpen(false));
   byId("globalSearchButton").addEventListener("click", () => { setView("orders"); byId("ordersSearch")?.focus(); });

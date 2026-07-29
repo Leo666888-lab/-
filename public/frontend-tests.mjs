@@ -295,7 +295,7 @@ test("is CSP-friendly and self-hosts visual dependencies", () => {
 });
 
 test("keeps the responsive commercial UI and keyboard accessibility contracts", () => {
-  assert.match(indexSource, /name="theme-color" content="#ff6900"/);
+  assert.match(indexSource, /name="theme-color" content="#17181a"/);
   assert.match(indexSource, /<title>思燕智能财务｜思燕家居<\/title>/);
   assert.equal((indexSource.match(/思燕家居/g) || []).length, 3);
   assert.match(indexSource, /<h1>思燕智能财务<\/h1>/);
@@ -314,7 +314,10 @@ test("keeps the responsive commercial UI and keyboard accessibility contracts", 
   assert.match(appSource, /reminder-group/);
   assert.match(appSource, /modalReturnFocus/);
   assert.match(appSource, /aria-current/);
-  assert.match(stylesSource, /--accent:\s*#ff6900/);
+  assert.match(stylesSource, /--accent:\s*#b39464/);
+  assert.match(stylesSource, /SiYan Quiet Intelligence/);
+  assert.match(indexSource, /id="desktopSidebarToggle"/);
+  assert.match(appSource, /function setDesktopSidebarCollapsed/);
   assert.match(stylesSource, /#detailModal\s*\{\s*place-items:\s*stretch end/);
   assert.match(stylesSource, /grid-template-columns:\s*minmax\(180px, \.8fr\) minmax\(0, 1\.2fr\)/);
   assert.match(stylesSource, /\.kpi strong, \.kpi \.currency-stack strong \{ white-space: normal/);
