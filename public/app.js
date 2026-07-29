@@ -150,6 +150,7 @@ class ApiClientError extends Error {
 }
 
 const byId = (id) => document.getElementById(id);
+const THEME_STORAGE_KEY = "siyan-ui-theme";
 
 function icon(name, size = 16) {
   const safeSize = Number.isFinite(Number(size)) ? Number(size) : 16;
@@ -158,6 +159,43 @@ function icon(name, size = 16) {
 
 function refreshIcons() {
   if (window.lucide) window.lucide.createIcons();
+}
+
+function readThemePreference() {
+  try {
+    return window.localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
+  }
+}
+
+function applyTheme(theme, { persist = false } = {}) {
+  const normalizedTheme = theme === "dark" ? "dark" : "light";
+  const isDark = normalizedTheme === "dark";
+  document.documentElement.dataset.theme = normalizedTheme;
+  document.documentElement.style.colorScheme = normalizedTheme;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", isDark ? "#101215" : "#202124");
+  if (persist) {
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, normalizedTheme);
+    } catch {
+      // Theme switching still works when browser storage is unavailable.
+    }
+  }
+  const nextLabel = isDark ? "浅色模式" : "深色模式";
+  document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(isDark));
+    button.setAttribute("aria-label", `切换到${nextLabel}`);
+    button.title = `切换到${nextLabel}`;
+    button.innerHTML = `${icon(isDark ? "sun" : "moon", 17)}<span>${nextLabel}</span>`;
+  });
+  refreshIcons();
+}
+
+function toggleTheme() {
+  const nextTheme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  applyTheme(nextTheme, { persist: true });
+  showToast(nextTheme === "dark" ? "已切换到深色模式" : "已切换到浅色模式");
 }
 
 function showToast(message, kind = "default") {
@@ -3612,6 +3650,7 @@ function bindEvents() {
     const action = event.target.closest("[data-action]");
     if (action) {
       const type = action.dataset.action;
+      if (type === "toggle-theme") toggleTheme();
       if (type === "fill-test-account") { byId("loginPhone").value = "13800000000"; byId("loginPassword").value = "demo1234"; }
       if (type === "new-order") openOrderModal(action.dataset.direction || "receivable");
       if (type === "new-partner") openPartnerModal();
@@ -3849,6 +3888,7 @@ function bindEvents() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  applyTheme(readThemePreference());
   configureEnvironmentUi();
   bindEvents();
   refreshIcons();

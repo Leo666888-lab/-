@@ -191,6 +191,16 @@ test("keeps local test helpers out of the online login surface", () => {
   assert.match(appSource, /localHostnames = new Set\(\["localhost", "127\.0\.0\.1", "::1"\]\)/);
 });
 
+test("provides accessible light and dark theme controls", () => {
+  assert.equal((indexSource.match(/data-theme-toggle/g) || []).length, 2);
+  assert.match(indexSource, /aria-label="切换到深色模式"/);
+  assert.match(appSource, /function applyTheme\(theme, \{ persist = false \} = \{\}\)/);
+  assert.match(appSource, /function toggleTheme\(\)/);
+  assert.match(appSource, /document\.documentElement\.dataset\.theme = normalizedTheme/);
+  assert.match(appSource, /meta\[name="theme-color"\]/);
+  assert.match(stylesSource, /html\[data-theme="dark"\]/);
+});
+
 test("keeps voucher currencies visible and blocks unsafe CNY account aggregation", () => {
   assert.match(appSource, /const currency = journal\.currency \|\| lines\.find\(\(line\) => line\.currency\)\?\.currency \|\| "CNY"/);
   assert.match(appSource, /const lineCurrency = line\.currency \|\| currency/);
@@ -226,8 +236,12 @@ test("uses one calendar-day rule for due filters, labels, and overdue status", (
   assert.equal(orderStatus({ fulfillmentStatus: "fulfilled", settlementStatus: "settled", outstandingCents: 0 }, { isOverdue: true }).className, "settled");
 });
 
-test("uses real API mutations and never persists session tokens in browser storage", () => {
-  assert.doesNotMatch(appSource, /localStorage|sessionStorage|indexedDB/);
+test("uses real API mutations and only persists an allowlisted UI theme preference", () => {
+  assert.doesNotMatch(appSource, /sessionStorage|indexedDB/);
+  assert.match(appSource, /const THEME_STORAGE_KEY = "siyan-ui-theme"/);
+  assert.match(appSource, /localStorage\.getItem\(THEME_STORAGE_KEY\)/);
+  assert.match(appSource, /localStorage\.setItem\(THEME_STORAGE_KEY, normalizedTheme\)/);
+  assert.doesNotMatch(appSource, /localStorage\.(getItem|setItem)\(\s*["'`](?!siyan-ui-theme)/);
   assert.match(appSource, /credentials:\s*"same-origin"/);
   assert.match(appSource, /"\/api\/auth\/login"/);
   assert.match(appSource, /"\/api\/bootstrap"/);
@@ -330,6 +344,8 @@ test("keeps the responsive commercial UI and keyboard accessibility contracts", 
   assert.match(stylesSource, /\.kpi strong, \.kpi \.currency-stack strong \{ white-space: normal/);
   assert.match(stylesSource, /\.commercial-lines \{ min-width: 0; \}/);
   assert.match(stylesSource, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(stylesSource, /\.sidebar \{ z-index: 31; \}/);
+  assert.match(stylesSource, /\.sidebar-scrim \{ z-index: 29; \}/);
   assert.doesNotMatch(`${indexSource}\n${appSource}\n${stylesSource}`, /\uFFFD/);
 });
 
