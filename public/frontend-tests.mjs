@@ -201,6 +201,15 @@ test("provides accessible light and dark theme controls", () => {
   assert.match(stylesSource, /html\[data-theme="dark"\]/);
 });
 
+test("keeps contact workspace and integrity protection readable in dark mode", () => {
+  assert.match(stylesSource, /\.contact-master[^\{]*\{[^}]*background: var\(--surface\)/);
+  assert.match(stylesSource, /\.contact-list-row:hover[^\{]*\{[^}]*background: var\(--surface-soft\)/);
+  assert.match(stylesSource, /\.contact-detail-heading[^\{]*\{[^}]*background: var\(--surface\)/);
+  assert.match(stylesSource, /html\[data-theme="dark"\] \.integrity-principle[^\{]*\{[^}]*background: var\(--success-soft\)[^}]*color: var\(--success-deep\)/);
+  assert.match(stylesSource, /html\[data-theme="dark"\] \.contact-master,/);
+  assert.match(stylesSource, /html\[data-theme="dark"\] \.contact-detail-heading/);
+});
+
 test("keeps voucher currencies visible and blocks unsafe CNY account aggregation", () => {
   assert.match(appSource, /const currency = journal\.currency \|\| lines\.find\(\(line\) => line\.currency\)\?\.currency \|\| "CNY"/);
   assert.match(appSource, /const lineCurrency = line\.currency \|\| currency/);

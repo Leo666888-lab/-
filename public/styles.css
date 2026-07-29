@@ -1186,7 +1186,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px
 
 /* Local-only import, OCR, and partner workspaces. */
 .contact-workspace { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(0, 1.18fr); min-height: 590px; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
-.contact-master { min-width: 0; border-right: 1px solid var(--line); background: #fbfbfc; }
+.contact-master { min-width: 0; border-right: 1px solid var(--line); background: var(--surface); }
 .contact-toolbar { display: grid; gap: 10px; padding: 14px; border-bottom: 1px solid var(--line); background: var(--surface); }
 .contact-toolbar .search-box { width: 100%; }
 .contact-kind-filter { flex-wrap: nowrap; }
@@ -1194,7 +1194,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px
 .contact-list { max-height: calc(100vh - 280px); min-height: 420px; overflow: auto; }
 .contact-list > .empty-state { min-height: 300px; }
 .contact-list-row { display: grid; grid-template-columns: 32px minmax(0, 1fr) minmax(92px, auto) 16px; align-items: center; gap: 10px; min-height: 74px; padding: 12px 13px; border-bottom: 1px solid var(--line); color: var(--ink); cursor: pointer; }
-.contact-list-row:hover { background: #f5f6f7; }
+.contact-list-row:hover { background: var(--surface-soft); }
 .contact-list-row.active { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
 .contact-list-row > svg { color: var(--faint); }
 .contact-list-copy, .contact-list-copy strong, .contact-list-copy small { display: block; min-width: 0; }
@@ -1205,7 +1205,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px
 .contact-balance-stack em { color: var(--muted); font-size: 9px; font-style: normal; }
 .contact-balance-stack small, .contact-zero-balance { color: var(--muted); font-size: 10px; text-align: right; }
 .contact-detail-pane { min-width: 0; max-height: calc(100vh - 168px); overflow: auto; background: var(--surface); }
-.contact-detail-heading { position: sticky; z-index: 2; top: 0; display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 17px 18px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.97); }
+.contact-detail-heading { position: sticky; z-index: 2; top: 0; display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 17px 18px; border-bottom: 1px solid var(--line); background: var(--surface); }
 .contact-detail-avatar { width: 42px; height: 42px; font-size: 15px; }
 .contact-detail-heading h2 { margin: 0; overflow-wrap: anywhere; font-size: 18px; }
 .contact-detail-heading span { color: var(--muted); font-size: 11px; }
@@ -3158,6 +3158,9 @@ html[data-theme="dark"] .kpi-top,
 html[data-theme="dark"] .accounting-snapshot-note { color: var(--muted); }
 html[data-theme="dark"] .quick-workbench-action,
 html[data-theme="dark"] .operating-metric { border-color: var(--line); background: var(--surface); color: var(--ink); }
+html[data-theme="dark"] .contact-master,
+html[data-theme="dark"] .contact-detail-heading { background: var(--surface); }
+html[data-theme="dark"] .contact-list-row:hover { background: var(--surface-soft); }
 html[data-theme="dark"] .quick-workbench-action:hover,
 html[data-theme="dark"] .operating-metric:hover,
 html[data-theme="dark"] .todo-row:hover,
@@ -3219,6 +3222,7 @@ html[data-theme="dark"] .payment-context span { color: var(--muted); }
 html[data-theme="dark"] .pending-note.danger-note { border-color: #68403e; background: var(--danger-soft); }
 html[data-theme="dark"] .alert-banner.urgent { border-color: #68403e; background: var(--danger-soft); }
 html[data-theme="dark"] .alert-banner.cleared { border-color: #355346; background: var(--success-soft); }
+html[data-theme="dark"] .integrity-principle { border-color: #355346; border-left-color: var(--success); background: var(--success-soft); color: var(--success-deep); }
 html[data-theme="dark"] .capability-status { border-color: #3b5269; background: var(--blue-soft); }
 html[data-theme="dark"] .capability-status.warning { border-color: #655237; background: var(--amber-soft); }
 html[data-theme="dark"] .capability-status.ready { border-color: #355346; background: var(--success-soft); }
