@@ -343,6 +343,9 @@ test("keeps the responsive commercial UI and keyboard accessibility contracts", 
   assert.match(stylesSource, /grid-template-columns:\s*minmax\(180px, \.8fr\) minmax\(0, 1\.2fr\)/);
   assert.match(stylesSource, /\.kpi strong, \.kpi \.currency-stack strong \{ white-space: normal/);
   assert.match(stylesSource, /\.commercial-lines \{ min-width: 0; \}/);
+  assert.match(stylesSource, /\.report-tabbar \{[\s\S]*grid-auto-flow: column;[\s\S]*background: var\(--surface-soft\);/);
+  assert.match(stylesSource, /\.report-tabbar \.report-tab \{ width: 100%; min-width: 0; white-space: nowrap; \}/);
+  assert.match(stylesSource, /\.report-tabbar \{ display: flex; flex-wrap: nowrap; width: 100%; overflow-x: auto; \}/);
   assert.match(stylesSource, /@media \(prefers-reduced-motion: reduce\)/);
   assert.match(stylesSource, /\.sidebar \{ z-index: 31; \}/);
   assert.match(stylesSource, /\.sidebar-scrim \{ z-index: 29; \}/);
